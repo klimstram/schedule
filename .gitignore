@@ -1,0 +1,6 @@
+# build scratch — the committed site lives in docs/
+site/
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
