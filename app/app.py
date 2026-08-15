@@ -73,7 +73,7 @@ FILES = ["staff.csv", "template.csv", "shifts.csv", "timeoff.csv", "holidays.csv
 SCHEMAS: dict[str, list[str]] = {
     "staff.csv": ["name"],
     "template.csv": ["weekday", "shift", "staff"],
-    "shifts.csv": ["date", "shift", "staff", "start", "end"],
+    "shifts.csv": ["date", "shift", "staff", "start", "end", "manual"],
     "timeoff.csv": ["staff", "start", "end", "type", "note"],
     "holidays.csv": ["date", "name"],
 }
@@ -205,8 +205,17 @@ def build_shifts(
 ) -> pd.DataFrame:
     """
     Generate weekday shift rows across a date range from the weekly template,
-    blanking anyone who has time off. Rows already present in `existing` that
-    differ from the template are preserved when keep_manual is True.
+    opening up anyone who has time off.
+
+    A row is preserved only when its `manual` column says "yes". That flag is
+    set when someone edits a single day, and cleared when they push a change
+    into the template. Inferring it instead — by comparing a row against the
+    template — cannot work: the moment the template changes, every row differs
+    from it and the whole schedule looks hand-edited, so nothing rebuilds.
+
+    Per-row times survive a rebuild even for template-driven rows, since the
+    template holds who works, not what hours. Untick keep_manual to reset
+    everything, times included.
     """
     tmpl: dict[tuple[str, str], str] = {}
     for _, r in template.iterrows():
@@ -214,16 +223,17 @@ def build_shifts(
         if wd in WEEKDAYS and sh in SHIFTS:
             tmpl[(wd, sh)] = str(r["staff"]).strip()
 
-    manual: dict[tuple[str, str], dict[str, str]] = {}
+    prior: dict[tuple[str, str], dict[str, str]] = {}
     if existing is not None and not existing.empty and keep_manual:
         for _, r in existing.iterrows():
             d = parse_date(r["date"])
             if d is None:
                 continue
-            manual[(d.isoformat(), str(r["shift"]).strip().upper())] = {
+            prior[(d.isoformat(), str(r["shift"]).strip().upper())] = {
                 "staff": str(r["staff"]).strip(),
                 "start": str(r["start"]).strip(),
                 "end": str(r["end"]).strip(),
+                "manual": str(r.get("manual", "")).strip().lower(),
             }
 
     rows: list[dict[str, str]] = []
@@ -232,22 +242,26 @@ def build_shifts(
         if day.weekday() < 5:
             wd = WEEKDAYS[day.weekday()]
             for sh in SHIFTS:
-                key = (day.isoformat(), sh)
                 who = tmpl.get((wd, sh), "")
-                if not who or is_off(who, day, timeoff):
-                    who = OPEN
                 d_start, d_end = DEFAULT_TIMES[sh]
-                if key in manual:
-                    prev = manual[key]
-                    prev_auto = tmpl.get((wd, sh), "")
-                    changed = prev["staff"] not in ("", prev_auto)
-                    if changed and not is_off(prev["staff"], day, timeoff):
-                        who = prev["staff"]
+                flag = ""
+
+                prev = prior.get((day.isoformat(), sh))
+                if prev:
                     d_start = prev["start"] or d_start
                     d_end = prev["end"] or d_end
+                    if (prev["manual"] == "yes" and prev["staff"]
+                            and not is_off(prev["staff"], day, timeoff)):
+                        who = prev["staff"]
+                        flag = "yes"
+
+                if not who or is_off(who, day, timeoff):
+                    # nobody rostered, or the rostered person is away
+                    who = OPEN
+
                 rows.append({
                     "date": day.isoformat(), "shift": sh, "staff": who,
-                    "start": d_start, "end": d_end,
+                    "start": d_start, "end": d_end, "manual": flag,
                 })
         day += dt.timedelta(days=1)
     return pd.DataFrame(rows, columns=SCHEMAS["shifts.csv"])
@@ -896,6 +910,15 @@ iconify-icon{{vertical-align:-.18em;}}
 .cs-brand small{{display:block; font-size:12px; font-weight:400; color:var(--m-gray-6);
   letter-spacing:0; margin-top:-2px;}}
 .cs-spacer{{margin-left:auto;}}
+.cs-sheetbox{{margin-left:auto;}}
+.cs-sheetbox .form-control{{min-width:270px; height:36px; font-size:13px;}}
+.cs-actions{{display:flex; gap:8px; align-items:center;}}
+.cs-two{{display:grid; grid-template-columns:1fr 1fr; gap:14px;}}
+.cs-pattern{{display:grid; grid-template-columns:repeat(5,minmax(130px,1fr)); gap:12px;}}
+.cs-formgrid{{display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:14px;}}
+/* never let a control push its container wider than the screen */
+.form-control,.form-select,.shiny-input-container{{max-width:100%;}}
+.shiny-input-container{{width:100%!important;}}
 .cs-shell{{max-width:1140px; margin:0 auto; padding:20px;}}
 
 /* ---------- buttons ---------- */
@@ -1025,8 +1048,36 @@ iconify-icon{{vertical-align:-.18em;}}
 }}
 .shiny-data-frame td{{border-color:var(--m-gray-1)!important;}}
 
-@media (max-width:640px){{
-  .cs-shell{{padding:12px;}} .cs-days{{grid-template-columns:1fr;}}
+/* ---------- phones and small tablets ---------- */
+@media (max-width:820px){{
+  html, body {{ overflow-x:hidden; }}
+  .cs-header{{
+    flex-wrap:wrap; row-gap:10px; padding:12px 14px; position:static;
+  }}
+  .cs-brand{{flex:1 1 auto;}}
+  .cs-sheetbox{{order:3; flex:1 1 100%; margin-left:0;}}
+  .cs-sheetbox .form-control{{min-width:0; width:100%;}}
+  .cs-statuswrap{{order:4; flex:1 1 100%;}}
+  .cs-actions{{order:5; flex:1 1 100%; flex-wrap:wrap;}}
+  .cs-actions .m-btn{{flex:1 1 auto; justify-content:center; min-width:120px;}}
+  .cs-shell{{padding:12px;}}
+  .cs-days{{grid-template-columns:1fr;}}
+  /* let the tab strip scroll rather than stack into two rows */
+  .nav-tabs{{flex-wrap:nowrap; overflow-x:auto; -webkit-overflow-scrolling:touch;
+             scrollbar-width:none;}}
+  .nav-tabs::-webkit-scrollbar{{display:none;}}
+  .nav-tabs .nav-link{{white-space:nowrap;}}
+  /* wide tables scroll inside their card instead of pushing the page */
+  .shiny-data-frame, .m-card-body > div[style*="grid"]{{max-width:100%;}}
+  .shiny-data-frame{{overflow-x:auto;}}
+  .m-card-head{{flex-wrap:wrap;}}
+  .m-card-head .sub{{margin-left:0; flex:1 1 100%;}}
+  .m-card-body{{padding:14px;}}
+  .cs-two{{grid-template-columns:1fr;}}
+  .cs-pattern{{grid-template-columns:repeat(2,1fr);}}
+  .cs-formgrid{{grid-template-columns:1fr;}}
+  .modal-dialog{{margin:8px;}}
+  .cs-toast{{bottom:14px; font-size:12.5px;}}
 }}
 """
 
@@ -1092,11 +1143,10 @@ app_ui = ui.page_fluid(
         ui.tags.input(
             id="sheet_url", type="text", class_="form-control",
             placeholder="Google Sheet link — or press New sheet",
-            style="min-width:280px;height:36px;font-size:13px;",
         ),
-        style="margin-left:auto;",
+        class_="cs-sheetbox",
     ),
-    ui.tags.div(ui.output_ui("conn_status")),
+    ui.tags.div(ui.output_ui("conn_status"), class_="cs-statuswrap"),
         btn("Open folder", "tabler:folder-open", "default", **{"data-cs": "open-folder"}),
         ui.output_ui("drive_button"),
         btn("Save", "tabler:device-floppy", "", id="btn_save"),
@@ -1276,7 +1326,7 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
                 **{"data-cs": "sheet-new", "data-cfg": cfg}),
             btn("Connect", "tabler:table-share", "default",
                 **{"data-cs": "sheet-connect", "data-cfg": cfg}),
-            style="display:flex;gap:8px;",
+            class_="cs-actions",
         )
 
     @render.ui
@@ -1396,9 +1446,16 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
                     badge = ui.tags.span(
                         who, class_="m-badge",
                         style=f"background:{colour_for(who, staff)}")
+                is_manual = (rec is not None
+                             and str(rec.get("manual", "")).strip().lower() == "yes")
                 slots.append(ui.tags.div(
                     ui.tags.span(sh, class_="lab"),
-                    ui.tags.div(badge, ui.tags.div(times, class_="cs-times")),
+                    ui.tags.div(
+                        badge,
+                        ui.tags.div(
+                            times + ("  · one-day" if is_manual else ""),
+                            class_="cs-times"),
+                    ),
                     ui.tags.span(icon("tabler:pencil"), class_="edit"),
                     class_="cs-slot",
                     **{"data-cs": "shift", "data-date": d.isoformat(), "data-shift": sh},
@@ -1446,7 +1503,7 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
             ui.tags.div(
                 ui.input_select("m_start", "Start", choices=TIME_CHOICES, selected=start),
                 ui.input_select("m_end", "End", choices=TIME_CHOICES, selected=end),
-                style="display:grid;grid-template-columns:1fr 1fr;gap:14px;",
+                class_="cs-two",
             ),
             ui.input_radio_buttons("m_scope", "Apply to", choices=scope, selected="once"),
             title=f"{shift} shift · {fmt_day(d) if d else date_iso}",
@@ -1479,15 +1536,18 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
         open_editor(str(row["date"]).strip(), str(row["shift"]).strip().upper())
 
     def write_shift(date_iso: str, shift: str, who: str,
-                    start: str, end: str) -> None:
+                    start: str, end: str, manual: str) -> None:
+        """manual="yes" protects the row from the next rebuild."""
         df = STORE.data["shifts.csv"]
+        if "manual" not in df.columns:
+            df["manual"] = ""
         mask = (df["date"] == date_iso) & (df["shift"].str.upper() == shift)
         if mask.any():
-            df.loc[mask, ["staff", "start", "end"]] = [who, start, end]
+            df.loc[mask, ["staff", "start", "end", "manual"]] = [who, start, end, manual]
         else:
             STORE.data["shifts.csv"] = pd.concat(
                 [df, pd.DataFrame([{"date": date_iso, "shift": shift, "staff": who,
-                                    "start": start, "end": end}])],
+                                    "start": start, "end": end, "manual": manual}])],
                 ignore_index=True,
             ).sort_values(["date", "shift"]).reset_index(drop=True)
 
@@ -1499,9 +1559,13 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
             return
         who = input.m_staff()
         start, end = input.m_start(), input.m_end()
-        write_shift(t["date"], t["shift"], who, start, end)
+        weekly = input.m_scope() == "weekly" and who not in (OPEN, CLOSED)
+        # a weekly change belongs to the template, so the row itself is no
+        # longer an override and must follow the pattern from here on
+        write_shift(t["date"], t["shift"], who, start, end,
+                    "" if weekly else "yes")
 
-        if input.m_scope() == "weekly" and who not in (OPEN, CLOSED):
+        if weekly:
             d = parse_date(t["date"])
             wd = WEEKDAYS[d.weekday()]
             tmpl = STORE.data["template.csv"]
@@ -1513,11 +1577,13 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
                     [tmpl, pd.DataFrame([{"weekday": wd, "shift": t["shift"], "staff": who}])],
                     ignore_index=True)
             # push it across every future date that still follows the pattern
-            for i, r in STORE.data["shifts.csv"].iterrows():
+            sdf = STORE.data["shifts.csv"]
+            for i, r in sdf.iterrows():
                 rd = parse_date(r["date"])
-                if rd and rd >= d and rd.weekday() == d.weekday() \
-                        and str(r["shift"]).upper() == t["shift"]:
-                    STORE.data["shifts.csv"].at[i, "staff"] = who
+                if (rd and rd >= d and rd.weekday() == d.weekday()
+                        and str(r["shift"]).upper() == t["shift"]
+                        and str(r.get("manual", "")).strip().lower() != "yes"):
+                    sdf.at[i, "staff"] = who
 
         ui.modal_remove()
         touch_all()
@@ -1533,9 +1599,12 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
             return
         rows = list(grid_shifts.data_view_rows() or [])
         df = STORE.data["shifts.csv"]
+        if "manual" not in df.columns:
+            df["manual"] = ""
         for p in picked:
             src = rows[p] if p < len(rows) else p
             df.iat[src, df.columns.get_loc("staff")] = OPEN
+            df.iat[src, df.columns.get_loc("manual")] = "yes"
         touch_all()
         await persist()
 
@@ -1594,7 +1663,7 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
             ))
         return ui.tags.div(
             *cols,
-            style="display:grid;grid-template-columns:repeat(5,minmax(140px,1fr));gap:12px;overflow-x:auto;",
+            class_="cs-pattern",
         )
 
     @reactive.effect

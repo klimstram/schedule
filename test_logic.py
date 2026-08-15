@@ -54,19 +54,60 @@ wk1_am = gen[(gen["shift"] == "AM") & (gen["date"] < "2026-08-10")]
 check("Sarah works week 1", set(wk1_am["staff"]), {"Sarah M."})
 check("Jordan unaffected", set(gen[gen["shift"] == "PM"]["staff"]), {"Jordan T."})
 
-# one-day change survives a rebuild when keep_manual is on
+# a row flagged manual="yes" survives a rebuild
 edited = gen.copy()
 idx = edited.index[(edited["date"] == "2026-08-04") & (edited["shift"] == "PM")][0]
 edited.at[idx, "staff"] = "Sarah M."
+edited.at[idx, "manual"] = "yes"
 again = build_shifts(dt.date(2026, 8, 3), dt.date(2026, 8, 14), template, timeoff,
                      existing=edited, keep_manual=True)
 kept = again[(again["date"] == "2026-08-04") & (again["shift"] == "PM")]["staff"].iloc[0]
-check("one-day change kept on rebuild", kept, "Sarah M.")
+check("flagged one-day change kept on rebuild", kept, "Sarah M.")
 
 wiped = build_shifts(dt.date(2026, 8, 3), dt.date(2026, 8, 14), template, timeoff,
                      existing=edited, keep_manual=False)
 back = wiped[(wiped["date"] == "2026-08-04") & (wiped["shift"] == "PM")]["staff"].iloc[0]
 check("one-day change dropped when asked", back, "Jordan T.")
+
+# THE REGRESSION THIS FIXES: change the template, rebuild, and unflagged rows
+# must follow the new pattern. Previously every row was compared against the
+# template, so changing it made the whole schedule look hand-edited and nothing
+# rebuilt at all.
+new_template = template.copy()
+new_template.loc[(new_template["weekday"] == "Tue") &
+                 (new_template["shift"] == "AM"), "staff"] = "Jordan T."
+rebuilt = build_shifts(dt.date(2026, 8, 3), dt.date(2026, 8, 14), new_template,
+                       timeoff, existing=gen, keep_manual=True)
+tue_am = rebuilt[(rebuilt["date"] == "2026-08-04") & (rebuilt["shift"] == "AM")]
+check("template change reaches the schedule", tue_am["staff"].iloc[0], "Jordan T.")
+mon_am = rebuilt[(rebuilt["date"] == "2026-08-03") & (rebuilt["shift"] == "AM")]
+check("other days untouched by that change", mon_am["staff"].iloc[0], "Sarah M.")
+
+# ...and a flagged row still resists it
+mixed = gen.copy()
+j = mixed.index[(mixed["date"] == "2026-08-04") & (mixed["shift"] == "AM")][0]
+mixed.at[j, "staff"] = "Sarah M."
+mixed.at[j, "manual"] = "yes"
+held = build_shifts(dt.date(2026, 8, 3), dt.date(2026, 8, 14), new_template,
+                    timeoff, existing=mixed, keep_manual=True)
+check("flagged row resists a template change",
+      held[(held["date"] == "2026-08-04") & (held["shift"] == "AM")]["staff"].iloc[0],
+      "Sarah M.")
+
+# custom hours survive a rebuild even on template-driven rows
+timed = gen.copy()
+k = timed.index[(timed["date"] == "2026-08-05") & (timed["shift"] == "AM")][0]
+timed.at[k, "start"] = "09:00"
+kept_times = build_shifts(dt.date(2026, 8, 3), dt.date(2026, 8, 14), template,
+                          timeoff, existing=timed, keep_manual=True)
+check("custom start time survives rebuild",
+      kept_times[(kept_times["date"] == "2026-08-05") &
+                 (kept_times["shift"] == "AM")]["start"].iloc[0], "09:00")
+reset = build_shifts(dt.date(2026, 8, 3), dt.date(2026, 8, 14), template,
+                     timeoff, existing=timed, keep_manual=False)
+check("full rebuild resets times",
+      reset[(reset["date"] == "2026-08-05") &
+            (reset["shift"] == "AM")]["start"].iloc[0], "08:00")
 
 # ------------------------------------------------------------- time off apply
 more_off = pd.DataFrame([{"staff": "Jordan T.", "start": "2026-08-05",

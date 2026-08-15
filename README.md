@@ -64,12 +64,21 @@ Five CSVs make up the schedule:
 |---|---|---|
 | `staff.csv` | `name` | Reception staff, max 15. Order sets each person's colour. |
 | `template.csv` | `weekday,shift,staff` | The regular weekly pattern. |
-| `shifts.csv` | `date,shift,staff,start,end` | The actual schedule — the source of truth. |
+| `shifts.csv` | `date,shift,staff,start,end,manual` | The actual schedule — the source of truth. |
 | `timeoff.csv` | `staff,start,end,type,note` | Vacation, sick, personal, other. |
 | `holidays.csv` | `date,name` | BC and national statutory holidays. |
 
 Dates are `YYYY-MM-DD`, times are 24-hour `HH:MM`. `OPEN` means an unfilled
 shift; `CLOSED` means the clinic is shut that half-day.
+
+`manual` is `yes` when that row is a deliberate one-day override, and empty when
+it simply follows the weekly pattern. **Rebuild** regenerates every empty row and
+leaves the `yes` rows alone; the week view marks them "· one-day".
+
+That flag has to be stored, not inferred. Deciding "is this a hand-edit?" by
+comparing a row to the template looks reasonable and is subtly broken: change the
+template and suddenly every row differs from it, so the whole schedule reads as
+hand-edited and **Rebuild** does nothing at all. `test_logic.py` pins this.
 
 The same five CSVs also live in [`app/data/`](app/data). Those are the ones
 bundled into the deployed site, so the app opens with something in it rather
@@ -154,7 +163,8 @@ from a dropdown, so a typo can't quietly break the hours report.
    **Set to OPEN** to clear it. Column filters help you find things.
 3. **Template tab** — the weekly pattern is a grid of dropdowns, one per
    weekday and shift. Change them, then **Rebuild** a date range from the
-   pattern. *Keep one-day changes* preserves anything that already differs.
+   pattern. *Keep one-day changes* protects rows flagged `manual`; untick it to
+   reset everything, custom hours included.
 4. **Time off tab** — booking time off automatically opens up that person's
    shifts across the range.
 
