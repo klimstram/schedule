@@ -474,8 +474,9 @@ BROWSER_JS = r"""
   var LS_KEY = "cedarsage.schedule.v1";
   var dirHandle = null;
   var queue = [];
-  var driveToken = null;
-  var driveFolder = null;
+  var SHEET_KEY = "cedarsage.sheeturl";
+  var sheetToken = null;
+  var sheetId = null;
 
   // ---------------------------------------------------------------- utils
   function send(name, value) {
@@ -571,10 +572,13 @@ BROWSER_JS = r"""
     return true;
   }
 
-  // ------------------------------------------------------- Google Drive
-  // Uses Google Identity Services for the token and the Drive REST API for
-  // the files. Scope is drive.file, so the app can only touch the folder it
-  // creates or that the user picks — it cannot read the rest of their Drive.
+  // ------------------------------------------------------- Google Sheets
+  // One spreadsheet, one tab per table. Reading and writing both go through
+  // the Sheets API with a token from Google Identity Services, so the sheet's
+  // own sharing settings decide who may edit and every change is attributed
+  // in its version history.
+  var TABS = ["staff", "template", "shifts", "timeoff", "holidays"];
+
   function loadScript(src) {
     return new Promise(function (resolve, reject) {
       if (document.querySelector('script[src="' + src + '"]')) return resolve();
@@ -585,101 +589,146 @@ BROWSER_JS = r"""
     });
   }
 
-  async function driveSignIn(cfg) {
+  function sheetIdFrom(url) {
+    var t = String(url || "").trim();
+    var m = t.match(/\/spreadsheets\/d\/([a-zA-Z0-9\-_]+)/);
+    if (m) return m[1];
+    return /^[a-zA-Z0-9\-_]{20,}$/.test(t) ? t : null;
+  }
+
+  // --- minimal CSV <-> grid, quoting to Sheets' expectations -------------
+  function toCsv(rows) {
+    return (rows || []).map(function (r) {
+      return (r || []).map(function (c) {
+        c = c === null || c === undefined ? "" : String(c);
+        return /[",\n]/.test(c) ? '"' + c.replace(/"/g, '""') + '"' : c;
+      }).join(",");
+    }).join("\n");
+  }
+
+  function fromCsv(text) {
+    var rows = [], row = [], cur = "", q = false;
+    text = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    for (var i = 0; i < text.length; i++) {
+      var ch = text[i];
+      if (q) {
+        if (ch === '"' && text[i + 1] === '"') { cur += '"'; i++; }
+        else if (ch === '"') { q = false; }
+        else { cur += ch; }
+      } else if (ch === '"') { q = true; }
+      else if (ch === ",") { row.push(cur); cur = ""; }
+      else if (ch === "\n") { row.push(cur); rows.push(row); row = []; cur = ""; }
+      else { cur += ch; }
+    }
+    if (cur !== "" || row.length) { row.push(cur); rows.push(row); }
+    return rows;
+  }
+
+  function gfetch(url, opts) {
+    opts = opts || {};
+    opts.headers = Object.assign(
+      { Authorization: "Bearer " + sheetToken, "Content-Type": "application/json" },
+      opts.headers || {});
+    return fetch(url, opts).then(function (r) {
+      if (!r.ok) {
+        return r.text().then(function (t) {
+          throw new Error("Sheets API " + r.status + " — " +
+                          (t || "").slice(0, 160));
+        });
+      }
+      return r;
+    });
+  }
+
+  var API = "https://sheets.googleapis.com/v4/spreadsheets/";
+
+  function signIn(cfg) {
+    return loadScript("https://accounts.google.com/gsi/client").then(function () {
+      return new Promise(function (resolve, reject) {
+        var tc = google.accounts.oauth2.initTokenClient({
+          client_id: cfg.client_id,
+          scope: "https://www.googleapis.com/auth/spreadsheets",
+          callback: function (r) {
+            if (r.error) reject(new Error(r.error));
+            else resolve(r.access_token);
+          }
+        });
+        tc.requestAccessToken({ prompt: sheetToken ? "" : "consent" });
+      });
+    });
+  }
+
+  async function tabTitles() {
+    var meta = await (await gfetch(API + sheetId + "?fields=sheets.properties.title")).json();
+    return (meta.sheets || []).map(function (s) { return s.properties.title; });
+  }
+
+  async function sheetLoad() {
+    var have = await tabTitles();
+    var want = TABS.filter(function (t) { return have.indexOf(t) >= 0; });
+    if (!want.length) {
+      toast("That sheet has no matching tabs yet — press Save to set it up.", "warn");
+      send("sheet_ready", JSON.stringify({ id: sheetId }));
+      return;
+    }
+    var qs = want.map(function (t) { return "ranges=" + encodeURIComponent(t); }).join("&");
+    var got = await (await gfetch(API + sheetId + "/values:batchGet?" + qs)).json();
+    var files = {};
+    (got.valueRanges || []).forEach(function (vr, i) {
+      files[want[i] + ".csv"] = toCsv(vr.values || []);
+    });
+    send("fs_load", JSON.stringify({
+      folder: "Google Sheet", files: files, source: "sheet"
+    }));
+  }
+
+  async function sheetWrite(files) {
+    var have = await tabTitles();
+    var missing = TABS.filter(function (t) { return have.indexOf(t) < 0; });
+    if (missing.length) {
+      await gfetch(API + sheetId + ":batchUpdate", {
+        method: "POST",
+        body: JSON.stringify({
+          requests: missing.map(function (t) {
+            return { addSheet: { properties: { title: t } } };
+          })
+        })
+      });
+    }
+    // clear first, so removing a row actually removes it
+    await gfetch(API + sheetId + "/values:batchClear", {
+      method: "POST", body: JSON.stringify({ ranges: TABS })
+    });
+    await gfetch(API + sheetId + "/values:batchUpdate", {
+      method: "POST",
+      body: JSON.stringify({
+        valueInputOption: "RAW",
+        data: TABS.map(function (t) {
+          return { range: t, values: fromCsv(files[t + ".csv"] || "") };
+        })
+      })
+    });
+  }
+
+  async function sheetConnect(cfg) {
+    var input = document.getElementById("sheet_url");
+    var url = input ? input.value : "";
+    if (!url) { url = localStorage.getItem(SHEET_KEY) || ""; }
+    var id = sheetIdFrom(url);
+    if (!id) { toast("Paste the full Google Sheet link first.", "warn"); return; }
     if (!cfg.client_id) {
       toast("No Google client ID configured yet — see the README.", "warn");
       return;
     }
     try {
-      await loadScript("https://accounts.google.com/gsi/client");
+      sheetToken = await signIn(cfg);
+      sheetId = id;
+      try { localStorage.setItem(SHEET_KEY, url); } catch (e) {}
+      await sheetLoad();
+      toast("Connected to the sheet.", "ok");
     } catch (e) {
-      toast("Could not load Google sign-in (network or blocker).", "error");
-      return;
+      toast("Sheet: " + (e && e.message ? e.message : e), "error");
     }
-    var tc = google.accounts.oauth2.initTokenClient({
-      client_id: cfg.client_id,
-      scope: "https://www.googleapis.com/auth/drive.file",
-      callback: async function (resp) {
-        if (resp.error) { toast("Sign-in failed: " + resp.error, "error"); return; }
-        driveToken = resp.access_token;
-        try { await driveLoad(cfg.folder_name); }
-        catch (e) { toast("Drive: " + e.message, "error"); }
-      }
-    });
-    tc.requestAccessToken({ prompt: "" });
-  }
-
-  function dfetch(url, opts) {
-    opts = opts || {};
-    opts.headers = Object.assign({ Authorization: "Bearer " + driveToken }, opts.headers || {});
-    return fetch(url, opts).then(function (r) {
-      if (!r.ok) throw new Error("Drive API " + r.status);
-      return r;
-    });
-  }
-
-  async function driveLoad(folderName) {
-    var q = encodeURIComponent(
-      "name='" + folderName + "' and mimeType='application/vnd.google-apps.folder' and trashed=false");
-    var found = await (await dfetch(
-      "https://www.googleapis.com/drive/v3/files?q=" + q + "&fields=files(id,name)")).json();
-
-    if (found.files && found.files.length) {
-      driveFolder = found.files[0].id;
-    } else {
-      var made = await (await dfetch("https://www.googleapis.com/drive/v3/files", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: folderName, mimeType: "application/vnd.google-apps.folder" })
-      })).json();
-      driveFolder = made.id;
-    }
-
-    var listing = await (await dfetch(
-      "https://www.googleapis.com/drive/v3/files?q=" +
-      encodeURIComponent("'" + driveFolder + "' in parents and trashed=false") +
-      "&fields=files(id,name)")).json();
-
-    var files = {};
-    for (var i = 0; i < (listing.files || []).length; i++) {
-      var f = listing.files[i];
-      if (!/\.csv$/i.test(f.name)) continue;
-      files[f.name] = await (await dfetch(
-        "https://www.googleapis.com/drive/v3/files/" + f.id + "?alt=media")).text();
-    }
-    send("fs_load", JSON.stringify({ folder: "Drive / " + folderName, files: files, source: "drive" }));
-  }
-
-  async function driveWrite(files) {
-    if (!driveToken || !driveFolder) return false;
-    var listing = await (await dfetch(
-      "https://www.googleapis.com/drive/v3/files?q=" +
-      encodeURIComponent("'" + driveFolder + "' in parents and trashed=false") +
-      "&fields=files(id,name)")).json();
-    var byName = {};
-    (listing.files || []).forEach(function (f) { byName[f.name] = f.id; });
-
-    for (var name in files) {
-      var body = files[name];
-      if (byName[name]) {
-        await dfetch("https://www.googleapis.com/upload/drive/v3/files/" + byName[name] +
-                     "?uploadType=media",
-                     { method: "PATCH", headers: { "Content-Type": "text/csv" }, body: body });
-      } else {
-        var boundary = "csb" + Math.floor(performance.now() * 1000);
-        var meta = { name: name, parents: [driveFolder], mimeType: "text/csv" };
-        var payload =
-          "--" + boundary + "\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n" +
-          JSON.stringify(meta) + "\r\n--" + boundary +
-          "\r\nContent-Type: text/csv\r\n\r\n" + body + "\r\n--" + boundary + "--";
-        await dfetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart", {
-          method: "POST",
-          headers: { "Content-Type": "multipart/related; boundary=" + boundary },
-          body: payload
-        });
-      }
-    }
-    return true;
   }
 
   // ------------------------------------------------------------- actions
@@ -690,10 +739,10 @@ BROWSER_JS = r"""
 
     if (action === "open-folder") { openFolder(); return; }
 
-    if (action === "drive-signin") {
+    if (action === "sheet-connect") {
       var cfg = {};
       try { cfg = JSON.parse(el.getAttribute("data-cfg") || "{}"); } catch (e) {}
-      driveSignIn(cfg);
+      sheetConnect(cfg);
       return;
     }
 
@@ -713,14 +762,14 @@ BROWSER_JS = r"""
     saveLocal(files);
     (async function () {
       try {
-        if (driveToken && driveFolder) {
-          await driveWrite(files);
-          toast("Saved to Google Drive.", "ok");
+        if (sheetToken && sheetId) {
+          await sheetWrite(files);
+          toast("Saved to the Google Sheet.", "ok");
         } else if (dirHandle) {
           await writeFolder(files);
           toast("Saved to " + dirHandle.name + ".", "ok");
         } else {
-          toast("Kept in this browser. Open a folder or sign in to Drive to save the files.", "info");
+          toast("Kept in this browser. Connect a Google Sheet to save it there.", "info");
         }
         send("save_done", Date.now());
       } catch (e) {
@@ -750,6 +799,11 @@ BROWSER_JS = r"""
     announced = true;
     flush();
     send("cs_caps", JSON.stringify(capabilities()));
+    try {
+      var savedUrl = localStorage.getItem(SHEET_KEY);
+      var box = document.getElementById("sheet_url");
+      if (savedUrl && box) box.value = savedUrl;
+    } catch (e) {}
     var cached = readLocal();
     if (cached && cached.files && Object.keys(cached.files).length) {
       send("fs_load", JSON.stringify({
@@ -997,7 +1051,15 @@ app_ui = ui.page_fluid(
             ui.tags.small("Reception schedule"),
             class_="cs-brand",
         ),
-        ui.tags.div(ui.output_ui("conn_status"), class_="cs-spacer"),
+        ui.tags.div(
+        ui.tags.input(
+            id="sheet_url", type="text", class_="form-control",
+            placeholder="Paste your Google Sheet link once",
+            style="min-width:280px;height:36px;font-size:13px;",
+        ),
+        style="margin-left:auto;",
+    ),
+    ui.tags.div(ui.output_ui("conn_status")),
         btn("Open folder", "tabler:folder-open", "default", **{"data-cs": "open-folder"}),
         ui.output_ui("drive_button"),
         btn("Save", "tabler:device-floppy", "", id="btn_save"),
@@ -1112,8 +1174,7 @@ app_ui = ui.page_fluid(
 # filled in, the Drive button explains what is missing instead of failing.
 # Setup steps are in the README.
 
-DRIVE_CLIENT_ID = ""
-DRIVE_FOLDER_NAME = "Cedar & Sage Schedule"
+GOOGLE_CLIENT_ID = ""   # OAuth client ID from your Google Cloud project
 
 
 def server(input: Inputs, output: Outputs, session: Session) -> None:
@@ -1151,8 +1212,8 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
         changed()
         c = caps()
         src = STORE.source
-        if src == "drive":
-            dot, label = "on", f"Google Drive · {STORE.folder}"
+        if src == "sheet":
+            dot, label = "on", "Google Sheet — saving there"
         elif src == "folder":
             dot, label = "on", f"Folder · {STORE.folder}"
         elif src == "browser":
@@ -1165,9 +1226,9 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
 
     @render.ui
     def drive_button():
-        cfg = json.dumps({"client_id": DRIVE_CLIENT_ID, "folder_name": DRIVE_FOLDER_NAME})
-        return btn("Google Drive", "tabler:brand-google-drive", "default",
-                   **{"data-cs": "drive-signin", "data-cfg": cfg})
+        cfg = json.dumps({"client_id": GOOGLE_CLIENT_ID})
+        return btn("Connect Sheet", "tabler:table-share", "default",
+                   **{"data-cs": "sheet-connect", "data-cfg": cfg})
 
     @render.ui
     def storage_note():
@@ -1180,11 +1241,11 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
                 "This browser is blocking local storage, so changes will not survive a "
                 "reload. Save to a folder or Drive as you go.", "warn",
                 "tabler:alert-triangle"))
-        if not c.get("fsa") and not DRIVE_CLIENT_ID:
+        if not c.get("fsa") and not GOOGLE_CLIENT_ID:
             bits.append(alert(
                 "This browser cannot open folders directly (that needs Chrome or Edge), "
-                "and Google Drive is not configured yet. Changes are kept in this browser "
-                "only. See the README to switch on Drive.", "warn",
+                "and the Google Sheet connection isn't configured yet. Changes are kept in "
+                "this browser only. See the README to switch on Sheets.", "warn",
                 "tabler:folder-off"))
         return ui.tags.div(*bits) if bits else None
 
@@ -1200,6 +1261,12 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
         touch_all()
         if STORE.source != "browser":
             await persist()
+
+    @reactive.effect
+    @reactive.event(input.sheet_ready)
+    def _sheet_ready() -> None:
+        STORE.source = "sheet"
+        touch_all()
 
     @reactive.effect
     @reactive.event(input.btn_save)

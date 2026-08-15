@@ -52,8 +52,8 @@ Three storage layers, in the order the app tries them:
 2. **A folder on disk**, via **Open folder**. Chrome and Edge only, since it
    uses the File System Access API. Point it at a folder synced by Google Drive
    for Desktop and sharing takes care of itself.
-3. **Google Drive**, via **Google Drive** sign-in. Works in every browser and on
-   phones. Needs a one-time Google Cloud setup — see below.
+3. **A Google Sheet**, via the link box and **Connect Sheet**. Works in every
+   browser and on phones. Needs a one-time Google Cloud setup — see below.
 
 **Save** writes to whichever of 2 or 3 is connected. If neither is, it says so
 and keeps everything in the browser.
@@ -90,34 +90,39 @@ than an empty grid.
 
 `starter-csvs/` holds an untouched copy to fall back on.
 
-### Switching on Google Drive
+### Using a Google Sheet (recommended)
 
-The app signs in with your own Google Cloud project, so the clinic's data never
-passes through anyone else's. Roughly ten minutes, once:
+One spreadsheet holds everything, one tab per table: `staff`, `template`,
+`shifts`, `timeoff`, `holidays`. Paste its link into the box in the header once
+and the app remembers it. Reading and writing both go through the Sheets API, so
+the sheet's own sharing settings decide who can edit, and every change is
+attributed in its version history.
 
-1. Go to [console.cloud.google.com](https://console.cloud.google.com) and create
-   a project.
-2. **APIs & Services → Library →** enable **Google Drive API**.
-3. **APIs & Services → OAuth consent screen →** External. Fill in the app name
-   and your email. While it stays in *Testing* you must list each staff member
-   under **Test users** — up to 100, and no Google verification is needed.
-4. **APIs & Services → Credentials → Create credentials → OAuth client ID →**
-   Web application. Under **Authorised JavaScript origins** add your Pages
-   origin exactly, with no trailing slash:
-   `https://YOUR-USERNAME.github.io`. Add `http://localhost:8000` too if you
-   want it working while developing.
-5. Copy the client ID and paste it into `DRIVE_CLIENT_ID` near the bottom of
-   `app/app.py`, then re-export and push.
+Missing tabs are created on the first save, so an empty spreadsheet is a fine
+starting point.
 
-The requested scope is `drive.file`, the narrowest one available: the app can
-only see the folder it creates (`Cedar & Sage Schedule`) and nothing else in
-anyone's Drive. Change `DRIVE_FOLDER_NAME` if you'd rather it were called
-something else.
+**One-time Google Cloud setup, about ten minutes:**
 
-Because each person signs in as themselves, `drive.file` gives them access to
-their *own* copy of that folder. To have several people work on one shared
-schedule, have the owner share the folder in Drive and keep one person as the
-one who saves — or move to a Shared Drive.
+1. [console.cloud.google.com](https://console.cloud.google.com) → create a project.
+2. **APIs & Services → Library →** enable **Google Sheets API**.
+3. **OAuth consent screen →** External. Add the app name and your email. While
+   it stays in *Testing* you list each staff member under **Test users** — up to
+   100, and no Google verification is needed.
+4. **Credentials → Create credentials → OAuth client ID →** Web application.
+   Under **Authorised JavaScript origins** add your Pages origin exactly, with
+   no trailing slash: `https://YOUR-USERNAME.github.io`. Add
+   `http://localhost:8000` as well if you want it working while developing.
+5. Paste the client ID into `GOOGLE_CLIENT_ID` in `app/app.py`, re-export, push.
+
+The scope is `spreadsheets`. Share the sheet with staff the normal way — anyone
+with edit access on the sheet can save from the app, anyone with view access can
+read it in Google Sheets directly without the app at all.
+
+**Why not store the data in this repo?** Writing a CSV or SQLite file back to
+GitHub needs an API token, and a static page cannot hide one. A token with write
+access to this repo would let any visitor push code that then deploys to your
+Pages URL. On top of that a public repo makes the records public. GitHub hosts
+the app; it must not hold the data.
 
 ### Putting the folder on Google Drive
 
@@ -187,7 +192,7 @@ artifact, and stop committing `docs/`. There's a ready-made workflow in
   the first time. It's cached afterwards, but the first visit on a new device
   takes a while — and it's a poor experience over cellular.
 - **Opening a folder needs Chrome or Edge.** The File System Access API doesn't
-  exist in Safari or Firefox. Those browsers should use Google Drive sign-in,
+  exist in Safari or Firefox. Those browsers should connect a Google Sheet,
   which works everywhere. Either way, browser storage keeps your work safe in
   the meantime.
 - **Icons and the typeface come from a CDN.** Iconify (`cdn.jsdelivr.net`) and
