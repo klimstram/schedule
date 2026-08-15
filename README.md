@@ -2,8 +2,12 @@
 
 A staff scheduling app for Cedar & Sage Physiotherapy. It runs entirely in the
 browser (Shiny for Python compiled to WebAssembly via shinylive), is hosted for
-free on GitHub Pages, and reads and writes plain CSV files on disk — either a
-local folder or a folder synced by Google Drive for Desktop.
+free on GitHub Pages, and keeps the schedule in plain CSV files — in browser
+storage, in a folder on disk, or in Google Drive.
+
+The interface follows Mantine's design language with Tabler icons via Iconify.
+Dash Mantine Components itself is a Dash library and cannot run inside Shiny,
+so the tokens, radii, shadows and spacing are reproduced in CSS.
 
 There is no server and no database. Nothing about the schedule ever leaves the
 clinic's own machines: the page is static, and the staff data lives only in the
@@ -38,11 +42,23 @@ Anything under `app/` — `app.py` and every CSV in `app/data/` — gets packed 
 `docs/app.json` by that export. Editing a source file without re-running the
 export changes nothing on the live site.
 
-## How the data works
+## Where your changes go
 
-Five CSVs live together in one folder. Click **Open schedule folder**, pick that
-folder once, and the app reads all five. Click **Save all changes** to write them
-back in place.
+Three storage layers, in the order the app tries them:
+
+1. **Browser storage, always.** Every change is written to `localStorage`
+   immediately. Close the tab, reload, come back tomorrow — your work is still
+   there. This needs no setup and works in every browser.
+2. **A folder on disk**, via **Open folder**. Chrome and Edge only, since it
+   uses the File System Access API. Point it at a folder synced by Google Drive
+   for Desktop and sharing takes care of itself.
+3. **Google Drive**, via **Google Drive** sign-in. Works in every browser and on
+   phones. Needs a one-time Google Cloud setup — see below.
+
+**Save** writes to whichever of 2 or 3 is connected. If neither is, it says so
+and keeps everything in the browser.
+
+Five CSVs make up the schedule:
 
 | File | Columns | What it holds |
 |---|---|---|
@@ -74,6 +90,35 @@ than an empty grid.
 
 `starter-csvs/` holds an untouched copy to fall back on.
 
+### Switching on Google Drive
+
+The app signs in with your own Google Cloud project, so the clinic's data never
+passes through anyone else's. Roughly ten minutes, once:
+
+1. Go to [console.cloud.google.com](https://console.cloud.google.com) and create
+   a project.
+2. **APIs & Services → Library →** enable **Google Drive API**.
+3. **APIs & Services → OAuth consent screen →** External. Fill in the app name
+   and your email. While it stays in *Testing* you must list each staff member
+   under **Test users** — up to 100, and no Google verification is needed.
+4. **APIs & Services → Credentials → Create credentials → OAuth client ID →**
+   Web application. Under **Authorised JavaScript origins** add your Pages
+   origin exactly, with no trailing slash:
+   `https://YOUR-USERNAME.github.io`. Add `http://localhost:8000` too if you
+   want it working while developing.
+5. Copy the client ID and paste it into `DRIVE_CLIENT_ID` near the bottom of
+   `app/app.py`, then re-export and push.
+
+The requested scope is `drive.file`, the narrowest one available: the app can
+only see the folder it creates (`Cedar & Sage Schedule`) and nothing else in
+anyone's Drive. Change `DRIVE_FOLDER_NAME` if you'd rather it were called
+something else.
+
+Because each person signs in as themselves, `drive.file` gives them access to
+their *own* copy of that folder. To have several people work on one shared
+schedule, have the owner share the folder in Drive and keep one person as the
+one who saves — or move to a Shared Drive.
+
 ### Putting the folder on Google Drive
 
 Install Google Drive for Desktop and put the folder inside your synced Drive.
@@ -82,16 +127,19 @@ everyone else. No API keys, no OAuth, no sharing links.
 
 ## Four ways to edit
 
-All of them end up writing the same `shifts.csv`:
+Nothing in the app requires typing a name or a time — every value is chosen
+from a dropdown, so a typo can't quietly break the hours report.
 
-1. **Week tab → Quick assign** — pick a day, shift and person. Fastest for
-   "Jordan is covering Tuesday afternoon".
-2. **Shifts tab** — the whole schedule as an editable grid. Click any cell and
-   type. Best for bulk fixes; the column filters help you find things.
-3. **Template & staff tab → Rebuild** — change the weekly pattern, then
-   regenerate a date range from it. *Keep one-day changes* preserves anything
-   that already differs from the template.
-4. **Time off tab** — adding time off automatically opens up that person's
+1. **Week tab** — click any shift on a day card. A dialog opens with three
+   dropdowns (who, start, end) and a choice between *just this day* and
+   *every Tuesday*. Picking the weekly option also updates the pattern and
+   every later matching shift.
+2. **Shifts tab** — select a row and press **Edit** for the same dialog, or
+   **Set to OPEN** to clear it. Column filters help you find things.
+3. **Template tab** — the weekly pattern is a grid of dropdowns, one per
+   weekday and shift. Change them, then **Rebuild** a date range from the
+   pattern. *Keep one-day changes* preserves anything that already differs.
+4. **Time off tab** — booking time off automatically opens up that person's
    shifts across the range.
 
 ## Hours and overtime
@@ -138,10 +186,13 @@ artifact, and stop committing `docs/`. There's a ready-made workflow in
 - **First load is slow.** The browser downloads roughly 40 MB of Python runtime
   the first time. It's cached afterwards, but the first visit on a new device
   takes a while — and it's a poor experience over cellular.
-- **Saving in place needs Chrome or Edge.** It uses the File System Access API,
-  which Safari and Firefox don't support. Those browsers fall back to uploading
-  the CSVs and downloading them again, under *If your browser can't open
-  folders* in the sidebar.
+- **Opening a folder needs Chrome or Edge.** The File System Access API doesn't
+  exist in Safari or Firefox. Those browsers should use Google Drive sign-in,
+  which works everywhere. Either way, browser storage keeps your work safe in
+  the meantime.
+- **Icons and the typeface come from a CDN.** Iconify (`cdn.jsdelivr.net`) and
+  Google Fonts. If either is blocked the app still works — buttons keep their
+  text labels and the type falls back to the system font.
 - **Concurrent edits are last-write-wins.** Two people saving the same file
   within a few minutes of each other will have Drive create a conflicted copy
   rather than merge them. Fine when one person owns the schedule; worth knowing

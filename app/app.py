@@ -37,7 +37,8 @@ import pathlib
 from typing import Any
 
 import pandas as pd
-from shiny import App, Inputs, Outputs, Session, reactive, render, req, ui
+from htmltools import Tag
+from shiny import App, Inputs, Outputs, Session, reactive, render, ui
 
 # --------------------------------------------------------------------------
 # brand + constants (kept in step with build_schedule.py)
@@ -392,38 +393,36 @@ SEED["shifts.csv"] = build_shifts(
 )
 
 
-# --------------------------------------------------------------------------
-# the store — plain (non-reactive) so grid edits don't retrigger the grid
-# --------------------------------------------------------------------------
+# ==========================================================================
+# storage: browser localStorage, a local folder, or Google Drive
+# ==========================================================================
 
 DATA_DIR = pathlib.Path(__file__).parent / "data"
 
 
 def load_bundled() -> tuple[dict[str, pd.DataFrame], str]:
     """
-    Read the CSVs shipped alongside the app. These are bundled into app.json by
-    `shinylive export`, so the deployed site opens with the clinic's real data
-    instead of the built-in example. Update them by committing new CSVs.
-    Falls back to SEED for anything missing or unreadable.
+    Read the CSVs shipped alongside the app. `shinylive export` packs anything
+    under the app directory into app.json, so these travel with the deployed
+    site. Falls back to SEED for anything missing or unreadable.
     """
     out: dict[str, pd.DataFrame] = {}
     found = 0
     for name in FILES:
-        path = DATA_DIR / name
         try:
-            raw = pd.read_csv(path, dtype=str, keep_default_na=False)
-            out[name] = coerce(raw, name)
+            out[name] = coerce(
+                pd.read_csv(DATA_DIR / name, dtype=str, keep_default_na=False), name)
             found += 1
         except Exception:
             out[name] = SEED[name].copy()
-    label = (f"bundled data ({found}/{len(FILES)} CSVs)" if found
-             else "built-in example data")
-    return out, label
+    return out, (f"bundled ({found}/{len(FILES)})" if found else "built-in example")
 
 
 class Store:
     def __init__(self) -> None:
         self.data, self.folder = load_bundled()
+        self.source = "bundled"
+        self.dirty = False
 
     def staff_names(self) -> list[str]:
         return [s for s in self.data["staff.csv"]["name"].tolist() if str(s).strip()]
@@ -456,260 +455,673 @@ class Store:
 
 STORE = Store()
 
+TIME_CHOICES = [fmt_time(6 + i * 0.25) for i in range(int((22 - 6) / 0.25) + 1)]
 
-# --------------------------------------------------------------------------
-# browser file-system glue
-# --------------------------------------------------------------------------
-# The picker must be called inside a real user gesture, so it is wired up in
-# plain JS on the button's click rather than through a Shiny event (which
-# arrives after the gesture has expired).
 
-FS_JS = """
+# ==========================================================================
+# browser glue: capability probe, localStorage, File System Access, Drive
+# ==========================================================================
+#
+# Everything here is defensive on purpose. The previous version registered a
+# Shiny message handler at parse time, before Shiny existed, which threw and
+# silently took the save path down with it. Now nothing touches Shiny until
+# it is actually ready, queued messages are flushed once it is, and failures
+# are written into a banner in the DOM so they are visible even if the Shiny
+# connection is the thing that broke.
+
+BROWSER_JS = r"""
 (function () {
-  window.__csDir = null;
+  var LS_KEY = "cedarsage.schedule.v1";
+  var dirHandle = null;
+  var queue = [];
+  var driveToken = null;
+  var driveFolder = null;
 
-  function announce(msg, ok) {
-    Shiny.setInputValue('fs_status', JSON.stringify({msg: msg, ok: !!ok, t: Date.now()}),
-                        {priority: 'event'});
+  // ---------------------------------------------------------------- utils
+  function send(name, value) {
+    if (window.Shiny && window.Shiny.setInputValue) {
+      try { window.Shiny.setInputValue(name, value, { priority: "event" }); return; }
+      catch (e) { /* fall through to queue */ }
+    }
+    queue.push([name, value]);
   }
 
-  document.addEventListener('click', async function (ev) {
-    var btn = ev.target.closest('#btn_open');
-    if (!btn) return;
-    if (!('showDirectoryPicker' in window)) {
-      announce('This browser cannot open folders directly. Use Chrome or Edge, ' +
-               'or use the upload box below.', false);
+  function flush() {
+    while (queue.length && window.Shiny && window.Shiny.setInputValue) {
+      var m = queue.shift();
+      try { window.Shiny.setInputValue(m[0], m[1], { priority: "event" }); }
+      catch (e) { break; }
+    }
+  }
+
+  function toast(msg, kind) {
+    var host = document.getElementById("cs-toast");
+    if (!host) { console.log("[schedule] " + msg); return; }
+    host.textContent = msg;
+    host.className = "cs-toast show " + (kind || "info");
+    clearTimeout(host._t);
+    host._t = setTimeout(function () { host.className = "cs-toast"; }, 4200);
+  }
+
+  function capabilities() {
+    var storage = false;
+    try { localStorage.setItem("_cs_t", "1"); localStorage.removeItem("_cs_t"); storage = true; }
+    catch (e) { storage = false; }
+    return {
+      fsa: typeof window.showDirectoryPicker === "function",
+      secure: !!window.isSecureContext,
+      storage: storage,
+      framed: window.top !== window.self,
+      origin: location.origin
+    };
+  }
+
+  // ------------------------------------------------------- local storage
+  function saveLocal(files) {
+    try { localStorage.setItem(LS_KEY, JSON.stringify({ t: Date.now(), files: files })); }
+    catch (e) { toast("Browser storage is full — changes are not being kept locally.", "warn"); }
+  }
+
+  function readLocal() {
+    try {
+      var raw = localStorage.getItem(LS_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) { return null; }
+  }
+
+  // -------------------------------------------------- File System Access
+  async function openFolder() {
+    var c = capabilities();
+    if (!c.secure) {
+      toast("This page is not a secure context, so folders can't be opened. Use https or localhost.", "warn");
+      return;
+    }
+    if (!c.fsa) {
+      toast("This browser has no folder access. Use Chrome or Edge, or sign in to Google Drive.", "warn");
       return;
     }
     try {
-      var dir = await window.showDirectoryPicker({ mode: 'readwrite', id: 'cedarsage' });
-      window.__csDir = dir;
+      var dir = await window.showDirectoryPicker({ mode: "readwrite", id: "cedarsage" });
+      if (dir.requestPermission) {
+        var perm = await dir.requestPermission({ mode: "readwrite" });
+        if (perm !== "granted") { toast("Write permission was declined.", "warn"); return; }
+      }
+      dirHandle = dir;
       var files = {};
       for await (var entry of dir.values()) {
-        if (entry.kind === 'file' && entry.name.toLowerCase().endsWith('.csv')) {
-          var f = await entry.getFile();
-          files[entry.name] = await f.text();
+        if (entry.kind === "file" && entry.name.toLowerCase().endsWith(".csv")) {
+          files[entry.name] = await (await entry.getFile()).text();
         }
       }
-      Shiny.setInputValue('fs_load',
-        JSON.stringify({ folder: dir.name, files: files, t: Date.now() }),
-        { priority: 'event' });
+      send("fs_load", JSON.stringify({ folder: dir.name, files: files, source: "folder" }));
     } catch (e) {
-      if (e && e.name === 'AbortError') return;
-      announce('Could not open that folder: ' + e, false);
+      if (e && e.name === "AbortError") return;
+      toast("Could not open that folder: " + (e && e.message ? e.message : e), "error");
     }
-  });
+  }
 
-  document.addEventListener('shiny:connected', function () {
-    Shiny.setInputValue('fs_supported', ('showDirectoryPicker' in window));
-  });
+  async function writeFolder(files) {
+    if (!dirHandle) return false;
+    for (var name in files) {
+      var h = await dirHandle.getFileHandle(name, { create: true });
+      var w = await h.createWritable();
+      await w.write(files[name]);
+      await w.close();
+    }
+    return true;
+  }
 
-  Shiny.addCustomMessageHandler('cs_save', async function (msg) {
-    if (!window.__csDir) {
-      announce('No folder open yet — click "Open schedule folder" first, ' +
-               'or use the download buttons.', false);
+  // ------------------------------------------------------- Google Drive
+  // Uses Google Identity Services for the token and the Drive REST API for
+  // the files. Scope is drive.file, so the app can only touch the folder it
+  // creates or that the user picks — it cannot read the rest of their Drive.
+  function loadScript(src) {
+    return new Promise(function (resolve, reject) {
+      if (document.querySelector('script[src="' + src + '"]')) return resolve();
+      var s = document.createElement("script");
+      s.src = src; s.async = true; s.defer = true;
+      s.onload = resolve; s.onerror = function () { reject(new Error("blocked: " + src)); };
+      document.head.appendChild(s);
+    });
+  }
+
+  async function driveSignIn(cfg) {
+    if (!cfg.client_id) {
+      toast("No Google client ID configured yet — see the README.", "warn");
       return;
     }
     try {
-      for (var name in msg.files) {
-        var h = await window.__csDir.getFileHandle(name, { create: true });
-        var w = await h.createWritable();
-        await w.write(msg.files[name]);
-        await w.close();
-      }
-      announce('Saved to ' + window.__csDir.name + '.', true);
+      await loadScript("https://accounts.google.com/gsi/client");
     } catch (e) {
-      announce('Save failed: ' + e, false);
+      toast("Could not load Google sign-in (network or blocker).", "error");
+      return;
+    }
+    var tc = google.accounts.oauth2.initTokenClient({
+      client_id: cfg.client_id,
+      scope: "https://www.googleapis.com/auth/drive.file",
+      callback: async function (resp) {
+        if (resp.error) { toast("Sign-in failed: " + resp.error, "error"); return; }
+        driveToken = resp.access_token;
+        try { await driveLoad(cfg.folder_name); }
+        catch (e) { toast("Drive: " + e.message, "error"); }
+      }
+    });
+    tc.requestAccessToken({ prompt: "" });
+  }
+
+  function dfetch(url, opts) {
+    opts = opts || {};
+    opts.headers = Object.assign({ Authorization: "Bearer " + driveToken }, opts.headers || {});
+    return fetch(url, opts).then(function (r) {
+      if (!r.ok) throw new Error("Drive API " + r.status);
+      return r;
+    });
+  }
+
+  async function driveLoad(folderName) {
+    var q = encodeURIComponent(
+      "name='" + folderName + "' and mimeType='application/vnd.google-apps.folder' and trashed=false");
+    var found = await (await dfetch(
+      "https://www.googleapis.com/drive/v3/files?q=" + q + "&fields=files(id,name)")).json();
+
+    if (found.files && found.files.length) {
+      driveFolder = found.files[0].id;
+    } else {
+      var made = await (await dfetch("https://www.googleapis.com/drive/v3/files", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: folderName, mimeType: "application/vnd.google-apps.folder" })
+      })).json();
+      driveFolder = made.id;
+    }
+
+    var listing = await (await dfetch(
+      "https://www.googleapis.com/drive/v3/files?q=" +
+      encodeURIComponent("'" + driveFolder + "' in parents and trashed=false") +
+      "&fields=files(id,name)")).json();
+
+    var files = {};
+    for (var i = 0; i < (listing.files || []).length; i++) {
+      var f = listing.files[i];
+      if (!/\.csv$/i.test(f.name)) continue;
+      files[f.name] = await (await dfetch(
+        "https://www.googleapis.com/drive/v3/files/" + f.id + "?alt=media")).text();
+    }
+    send("fs_load", JSON.stringify({ folder: "Drive / " + folderName, files: files, source: "drive" }));
+  }
+
+  async function driveWrite(files) {
+    if (!driveToken || !driveFolder) return false;
+    var listing = await (await dfetch(
+      "https://www.googleapis.com/drive/v3/files?q=" +
+      encodeURIComponent("'" + driveFolder + "' in parents and trashed=false") +
+      "&fields=files(id,name)")).json();
+    var byName = {};
+    (listing.files || []).forEach(function (f) { byName[f.name] = f.id; });
+
+    for (var name in files) {
+      var body = files[name];
+      if (byName[name]) {
+        await dfetch("https://www.googleapis.com/upload/drive/v3/files/" + byName[name] +
+                     "?uploadType=media",
+                     { method: "PATCH", headers: { "Content-Type": "text/csv" }, body: body });
+      } else {
+        var boundary = "csb" + Math.floor(performance.now() * 1000);
+        var meta = { name: name, parents: [driveFolder], mimeType: "text/csv" };
+        var payload =
+          "--" + boundary + "\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n" +
+          JSON.stringify(meta) + "\r\n--" + boundary +
+          "\r\nContent-Type: text/csv\r\n\r\n" + body + "\r\n--" + boundary + "--";
+        await dfetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart", {
+          method: "POST",
+          headers: { "Content-Type": "multipart/related; boundary=" + boundary },
+          body: payload
+        });
+      }
+    }
+    return true;
+  }
+
+  // ------------------------------------------------------------- actions
+  document.addEventListener("click", function (ev) {
+    var el = ev.target.closest("[data-cs]");
+    if (!el) return;
+    var action = el.getAttribute("data-cs");
+
+    if (action === "open-folder") { openFolder(); return; }
+
+    if (action === "drive-signin") {
+      var cfg = {};
+      try { cfg = JSON.parse(el.getAttribute("data-cfg") || "{}"); } catch (e) {}
+      driveSignIn(cfg);
+      return;
+    }
+
+    if (action === "shift") {
+      send("cell_click", JSON.stringify({
+        date: el.getAttribute("data-date"),
+        shift: el.getAttribute("data-shift"),
+        n: Math.random()
+      }));
+      return;
     }
   });
+
+  // ------------------------------------------------- messages from Shiny
+  function onSave(msg) {
+    var files = msg.files;
+    saveLocal(files);
+    (async function () {
+      try {
+        if (driveToken && driveFolder) {
+          await driveWrite(files);
+          toast("Saved to Google Drive.", "ok");
+        } else if (dirHandle) {
+          await writeFolder(files);
+          toast("Saved to " + dirHandle.name + ".", "ok");
+        } else {
+          toast("Kept in this browser. Open a folder or sign in to Drive to save the files.", "info");
+        }
+        send("save_done", Date.now());
+      } catch (e) {
+        toast("Save failed: " + (e && e.message ? e.message : e), "error");
+      }
+    })();
+  }
+
+  function onAutosave(msg) { saveLocal(msg.files); }
+
+  // Registering the message handlers only needs the Shiny object to exist.
+  function wire() {
+    if (!window.Shiny || !window.Shiny.addCustomMessageHandler) {
+      return setTimeout(wire, 60);
+    }
+    window.Shiny.addCustomMessageHandler("cs_save", onSave);
+    window.Shiny.addCustomMessageHandler("cs_autosave", onAutosave);
+  }
+  wire();
+
+  // Sending inputs is different: setInputValue before the session connects is
+  // dropped on the floor, which is why the restore-from-browser silently did
+  // nothing. Wait for shiny:connected, and guard against having missed it.
+  var announced = false;
+  function afterConnect() {
+    if (announced) return;
+    announced = true;
+    flush();
+    send("cs_caps", JSON.stringify(capabilities()));
+    var cached = readLocal();
+    if (cached && cached.files && Object.keys(cached.files).length) {
+      send("fs_load", JSON.stringify({
+        folder: "this browser", files: cached.files, source: "browser"
+      }));
+    }
+  }
+  document.addEventListener("shiny:connected", afterConnect);
+  (function poll(n) {
+    if (announced) return;
+    if (window.Shiny && window.Shiny.shinyapp && window.Shiny.shinyapp.$socket) {
+      return afterConnect();
+    }
+    if (n < 200) setTimeout(function () { poll(n + 1); }, 100);
+  })(0);
 })();
 """
 
-CSS = f"""
-body {{ background: {CREAM}; }}
-.navbar, .bslib-sidebar-layout > .sidebar {{ background: #fff; }}
-h1, h2, h3, h4, .card-header {{ font-family: Georgia, 'Times New Roman', serif; color: {NAVY}; }}
-.cs-title {{ font-size: 1.15rem; margin: 0; }}
-.cs-sub {{ font-size: .78rem; color: {MUTED}; font-family: Arial, sans-serif; }}
-.cs-week {{ width: 100%; border-collapse: separate; border-spacing: 0 6px; }}
-.cs-week td {{ padding: 8px 10px; background: #fff; border-top: 1px solid {LINE};
-              border-bottom: 1px solid {LINE}; vertical-align: middle; }}
-.cs-week td:first-child {{ border-left: 1px solid {LINE};
-                           border-radius: 10px 0 0 10px; width: 128px; }}
-.cs-week td:last-child {{ border-right: 1px solid {LINE}; border-radius: 0 10px 10px 0;
-                          text-align: right; color: {MUTED}; font-size: .82rem;
-                          white-space: nowrap; }}
-.cs-week tr.stat td {{ background: {GOLD}; }}
-.cs-day {{ font-weight: bold; color: {NAVY}; font-size: .88rem; }}
-.cs-tag {{ color: {MUTED}; font-size: .7rem; letter-spacing: .06em; width: 34px; }}
-.cs-pill {{ display: inline-block; padding: 4px 12px; border-radius: 13px;
-            font-size: .85rem; font-weight: bold; color: {NAVY}; }}
-.cs-pill.open {{ background: {OPEN_RED}; color: #fff; }}
-.cs-statname {{ font-size: .7rem; color: #8A6A2F; font-style: italic; }}
-.cs-flag {{ font-size: .72rem; color: {OPEN_RED}; }}
-.cs-ok {{ font-size: .72rem; color: {SAGE}; }}
+ICONIFY = "https://cdn.jsdelivr.net/npm/iconify-icon@2/dist/iconify-icon.min.js"
+FONT = "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+
+# Mantine's design language, rebuilt as plain CSS: its 10-step gray ramp,
+# radius and shadow scales, and Inter as the type face. Dash Mantine
+# Components itself is Dash-only and cannot run inside Shiny.
+MANTINE_CSS = f"""
+:root {{
+  --m-white:#fff;
+  --m-gray-0:#f8f9fa; --m-gray-1:#f1f3f5; --m-gray-2:#e9ecef; --m-gray-3:#dee2e6;
+  --m-gray-4:#ced4da; --m-gray-5:#adb5bd; --m-gray-6:#868e96; --m-gray-7:#495057;
+  --m-gray-8:#343a40; --m-gray-9:#212529;
+  --m-primary:{NAVY}; --m-primary-hover:#25344a; --m-primary-light:#eef1f5;
+  --m-sage:{SAGE}; --m-red:{OPEN_RED}; --m-gold:{GOLD};
+  --m-radius-sm:4px; --m-radius:8px; --m-radius-lg:12px; --m-radius-xl:16px;
+  --m-shadow-xs:0 1px 3px rgba(0,0,0,.05);
+  --m-shadow-sm:0 1px 3px rgba(0,0,0,.05),0 10px 15px -5px rgba(0,0,0,.05);
+  --m-shadow-md:0 1px 3px rgba(0,0,0,.05),0 12px 20px -8px rgba(0,0,0,.08);
+}}
+*{{box-sizing:border-box;}}
+body{{
+  font-family:Inter,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;
+  font-size:14px; line-height:1.55; color:var(--m-gray-9);
+  background:var(--m-gray-0); -webkit-font-smoothing:antialiased;
+}}
+iconify-icon{{vertical-align:-.18em;}}
+
+/* ---------- shell ---------- */
+.cs-header{{
+  background:var(--m-white); border-bottom:1px solid var(--m-gray-2);
+  padding:14px 20px; display:flex; align-items:center; gap:14px;
+  position:sticky; top:0; z-index:30;
+}}
+.cs-brand{{font-size:16px; font-weight:600; color:var(--m-primary); letter-spacing:-.01em;}}
+.cs-brand small{{display:block; font-size:12px; font-weight:400; color:var(--m-gray-6);
+  letter-spacing:0; margin-top:-2px;}}
+.cs-spacer{{margin-left:auto;}}
+.cs-shell{{max-width:1140px; margin:0 auto; padding:20px;}}
+
+/* ---------- buttons ---------- */
+.m-btn{{
+  display:inline-flex; align-items:center; gap:7px; height:36px; padding:0 16px;
+  border-radius:var(--m-radius); border:1px solid transparent; cursor:pointer;
+  font-family:inherit; font-size:14px; font-weight:500; white-space:nowrap;
+  background:var(--m-primary); color:#fff; transition:background .12s,border-color .12s;
+}}
+.m-btn:hover{{background:var(--m-primary-hover);}}
+.m-btn:active{{transform:translateY(1px);}}
+.m-btn.light{{background:var(--m-primary-light); color:var(--m-primary);}}
+.m-btn.light:hover{{background:#e3e8ef;}}
+.m-btn.default{{background:var(--m-white); color:var(--m-gray-9); border-color:var(--m-gray-3);}}
+.m-btn.default:hover{{background:var(--m-gray-0);}}
+.m-btn.subtle{{background:transparent; color:var(--m-gray-7);}}
+.m-btn.subtle:hover{{background:var(--m-gray-1);}}
+.m-btn.sm{{height:30px; padding:0 12px; font-size:13px;}}
+.m-btn.danger{{background:var(--m-red);}}
+.m-btn.block{{width:100%; justify-content:center;}}
+
+/* ---------- cards ---------- */
+.m-card{{
+  background:var(--m-white); border:1px solid var(--m-gray-2);
+  border-radius:var(--m-radius-lg); box-shadow:var(--m-shadow-xs); margin-bottom:16px;
+}}
+.m-card-head{{
+  padding:14px 18px; border-bottom:1px solid var(--m-gray-2);
+  display:flex; align-items:center; gap:9px; font-weight:600; color:var(--m-gray-9);
+}}
+.m-card-head .sub{{font-weight:400; color:var(--m-gray-6); font-size:13px; margin-left:auto;}}
+.m-card-body{{padding:18px;}}
+.m-card-body.tight{{padding:10px 12px;}}
+
+/* ---------- day cards ---------- */
+.cs-days{{display:grid; grid-template-columns:repeat(5,1fr); gap:14px;}}
+@media (max-width:1100px){{.cs-days{{grid-template-columns:repeat(2,1fr);}}}}
+.cs-day{{
+  background:var(--m-white); border:1px solid var(--m-gray-2);
+  border-radius:var(--m-radius-lg); overflow:hidden; box-shadow:var(--m-shadow-xs);
+}}
+.cs-day.today{{border-color:var(--m-primary); box-shadow:0 0 0 3px var(--m-primary-light);}}
+.cs-day.stat{{border-color:#e8d6a8;}}
+.cs-day-head{{padding:11px 14px; border-bottom:1px solid var(--m-gray-2); background:var(--m-gray-0);}}
+.cs-day.stat .cs-day-head{{background:var(--m-gold);}}
+.cs-dow{{font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--m-gray-6);}}
+.cs-dnum{{font-size:17px; font-weight:600; color:var(--m-gray-9); line-height:1.2;}}
+.cs-stat-name{{font-size:11px; color:#8A6A2F; margin-top:2px;}}
+.cs-slot{{
+  display:flex; align-items:center; gap:9px; padding:11px 14px; cursor:pointer;
+  border-top:1px solid var(--m-gray-1); transition:background .1s;
+}}
+.cs-slot:hover{{background:var(--m-gray-0);}}
+.cs-slot:first-of-type{{border-top:0;}}
+.cs-slot .lab{{
+  font-size:11px; font-weight:600; color:var(--m-gray-5); width:22px; flex:0 0 22px;
+}}
+.cs-slot .edit{{margin-left:auto; color:var(--m-gray-4); font-size:15px;}}
+.cs-slot:hover .edit{{color:var(--m-primary);}}
+.cs-times{{font-size:11px; color:var(--m-gray-6); margin-top:2px;}}
+.m-badge{{
+  display:inline-block; padding:3px 11px; border-radius:14px; font-size:13px;
+  font-weight:600; color:var(--m-primary); background:var(--m-gray-2);
+  max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}}
+.m-badge.open{{background:#ffe3e3; color:#c92a2a;}}
+.m-badge.closed{{background:var(--m-gray-2); color:var(--m-gray-6);}}
+
+/* ---------- misc ---------- */
+.m-alert{{
+  display:flex; gap:10px; padding:12px 14px; border-radius:var(--m-radius);
+  background:var(--m-primary-light); color:var(--m-gray-8); font-size:13px;
+  margin-bottom:14px; align-items:flex-start;
+}}
+.m-alert.warn{{background:#fff4e6; color:#8a5a1f;}}
+.m-alert.ok{{background:#ebfbee; color:#2b6a35;}}
+.m-alert iconify-icon{{font-size:17px; flex:0 0 auto; margin-top:1px;}}
+.cs-status{{display:flex; align-items:center; gap:7px; font-size:13px; color:var(--m-gray-6);}}
+.cs-dot{{width:8px; height:8px; border-radius:4px; background:var(--m-gray-4);}}
+.cs-dot.on{{background:var(--m-sage);}}
+.cs-dot.warn{{background:#f59f00;}}
+.cs-toast{{
+  position:fixed; left:50%; bottom:26px; transform:translateX(-50%) translateY(120%);
+  background:var(--m-gray-9); color:#fff; padding:11px 18px; border-radius:var(--m-radius);
+  font-size:13px; z-index:100; box-shadow:var(--m-shadow-md); opacity:0;
+  transition:transform .18s,opacity .18s; max-width:88vw; text-align:center;
+}}
+.cs-toast.show{{transform:translateX(-50%) translateY(0); opacity:1;}}
+.cs-toast.ok{{background:#2b8a3e;}} .cs-toast.error{{background:#c92a2a;}}
+.cs-toast.warn{{background:#e8590c;}}
+
+/* ---------- form controls ---------- */
+.form-control,.form-select,.selectize-input{{
+  border:1px solid var(--m-gray-3)!important; border-radius:var(--m-radius)!important;
+  font-size:14px!important; min-height:36px!important; box-shadow:none!important;
+  color:var(--m-gray-9)!important;
+}}
+.form-control:focus,.form-select:focus,.selectize-input.focus{{
+  border-color:var(--m-primary)!important; box-shadow:0 0 0 3px var(--m-primary-light)!important;
+}}
+.control-label,label{{font-size:13px!important; font-weight:500; color:var(--m-gray-7); margin-bottom:5px;}}
+
+/* ---------- tabs ---------- */
+.nav-tabs{{border-bottom:1px solid var(--m-gray-2); gap:2px; margin-bottom:18px;}}
+.nav-tabs .nav-link{{
+  border:0!important; border-bottom:2px solid transparent!important;
+  color:var(--m-gray-6); font-weight:500; font-size:14px; padding:9px 15px;
+  display:flex; align-items:center; gap:6px; background:transparent!important;
+}}
+.nav-tabs .nav-link:hover{{color:var(--m-gray-9); background:var(--m-gray-1)!important;
+  border-radius:var(--m-radius) var(--m-radius) 0 0;}}
+.nav-tabs .nav-link.active{{color:var(--m-primary)!important;
+  border-bottom-color:var(--m-primary)!important;}}
+
+/* ---------- modal ---------- */
+.modal-content{{border:0; border-radius:var(--m-radius-lg); box-shadow:var(--m-shadow-md);}}
+.modal-header{{border-bottom:1px solid var(--m-gray-2); padding:16px 20px;}}
+.modal-title{{font-size:16px; font-weight:600; color:var(--m-gray-9);}}
+.modal-body{{padding:20px;}}
+.modal-footer{{border-top:1px solid var(--m-gray-2); padding:12px 20px;}}
+
+/* ---------- data grid ---------- */
+.shiny-data-frame table{{font-size:13px;}}
+.shiny-data-frame thead th{{
+  background:var(--m-gray-0)!important; font-weight:600!important;
+  color:var(--m-gray-7)!important; border-bottom:1px solid var(--m-gray-2)!important;
+}}
+.shiny-data-frame td{{border-color:var(--m-gray-1)!important;}}
+
+@media (max-width:640px){{
+  .cs-shell{{padding:12px;}} .cs-days{{grid-template-columns:1fr;}}
+}}
 """
 
 
-# --------------------------------------------------------------------------
-# UI
-# --------------------------------------------------------------------------
+def icon(name: str, size: str = "16px", colour: str | None = None):
+    """An Iconify web component. Tabler icons, the set Mantine itself uses."""
+    style = f"font-size:{size};" + (f"color:{colour};" if colour else "")
+    return Tag("iconify-icon", icon=name, style=style)
 
-app_ui = ui.page_sidebar(
-    ui.sidebar(
-        ui.h4("Cedar & Sage", class_="cs-title"),
-        ui.p("Reception schedule", class_="cs-sub"),
-        ui.hr(),
-        ui.input_action_button("btn_open", "Open schedule folder", class_="btn-primary w-100"),
-        ui.output_ui("folder_note"),
-        ui.input_action_button("btn_save", "Save all changes", class_="btn-outline-primary w-100 mt-2"),
-        ui.output_ui("save_note"),
-        ui.hr(),
-        ui.input_date("week_of", "Week of", value=dt.date(2026, 8, 3), weekstart=1),
-        ui.hr(),
-        ui.accordion(
-            ui.accordion_panel(
-                "If your browser can't open folders",
-                ui.p("Safari and Firefox can't write to a folder. Upload the CSVs here, "
-                     "then use the download buttons to save them back.",
-                     class_="cs-sub"),
-                ui.input_file("upload", "Upload CSV files", multiple=True, accept=[".csv"]),
-                ui.download_button("dl_shifts", "Download shifts.csv", class_="btn-sm w-100 mb-1"),
-                ui.download_button("dl_all", "Download all as one CSV", class_="btn-sm w-100"),
-            ),
-            open=False,
-        ),
-        width=320,
+
+def card(title: str, icon_name: str, *body, sub: str = "", tight: bool = False):
+    head = [icon(title and icon_name or icon_name, "17px", NAVY), title]
+    if sub:
+        head.append(ui.tags.span(sub, class_="sub"))
+    return ui.tags.div(
+        ui.tags.div(*head, class_="m-card-head"),
+        ui.tags.div(*body, class_=f"m-card-body{' tight' if tight else ''}"),
+        class_="m-card",
+    )
+
+
+def btn(label: str, icon_name: str, variant: str = "", **kw):
+    """
+    A Mantine-styled button. When given an id it also carries Bootstrap's
+    `action-button` class, which is what Shiny binds to — so these behave as
+    ordinary action buttons on the server despite the custom markup.
+    """
+    cls = f"m-btn {variant}".strip()
+    if "id" in kw:
+        cls += " action-button"
+    return ui.tags.button(icon(icon_name), label, class_=cls, type="button", **kw)
+
+
+def alert(text: str, kind: str = "", icon_name: str = "tabler:info-circle"):
+    return ui.tags.div(icon(icon_name), ui.tags.div(text), class_=f"m-alert {kind}".strip())
+
+
+# ==========================================================================
+# UI
+# ==========================================================================
+
+def tab_label(name: str, icon_name: str):
+    return ui.tags.span(icon(icon_name), name)
+
+
+app_ui = ui.page_fluid(
+    ui.head_content(
+    ui.tags.meta(name="viewport", content="width=device-width, initial-scale=1"),
+    ui.tags.link(rel="stylesheet", href=FONT),
+    ui.tags.script(src=ICONIFY),
+    ui.tags.style(MANTINE_CSS),
+    ui.tags.script(BROWSER_JS),
     ),
-    ui.head_content(ui.tags.style(CSS), ui.tags.script(FS_JS)),
-    ui.navset_tab(
-        ui.nav_panel(
-            "Week",
-            ui.card(
-                ui.card_header(ui.output_text("week_header")),
+
+    ui.tags.div(
+        icon("tabler:calendar-heart", "26px", NAVY),
+        ui.tags.div(
+            "Cedar & Sage",
+            ui.tags.small("Reception schedule"),
+            class_="cs-brand",
+        ),
+        ui.tags.div(ui.output_ui("conn_status"), class_="cs-spacer"),
+        btn("Open folder", "tabler:folder-open", "default", **{"data-cs": "open-folder"}),
+        ui.output_ui("drive_button"),
+        btn("Save", "tabler:device-floppy", "", id="btn_save"),
+        class_="cs-header",
+    ),
+    ui.tags.div(
+        ui.output_ui("storage_note"),
+        ui.navset_tab(
+            ui.nav_panel(
+                tab_label("Week", "tabler:calendar-week"),
+                ui.tags.div(
+                    btn("\u2039", "tabler:chevron-left", "default", id="wk_prev"),
+                    ui.tags.span(ui.output_text("week_header"),
+                                 style="font-weight:600;margin:0 14px;"),
+                    btn("\u203a", "tabler:chevron-right", "default", id="wk_next"),
+                    btn("This week", "tabler:calendar-due", "subtle", id="wk_today"),
+                    style="display:flex;align-items:center;margin-bottom:16px;",
+                ),
                 ui.output_ui("week_view"),
-            ),
-            ui.card(
-                ui.card_header("Quick assign"),
-                ui.layout_columns(
-                    ui.input_select("qa_date", "Day", choices=[]),
-                    ui.input_select("qa_shift", "Shift", choices=SHIFTS),
-                    ui.input_select("qa_staff", "Who", choices=[]),
-                    ui.input_text("qa_start", "Start", placeholder="08:00"),
-                    ui.input_text("qa_end", "End", placeholder="13:00"),
-                    col_widths=[3, 2, 3, 2, 2],
+                ui.tags.p(
+                    icon("tabler:hand-click"),
+                    " Click any shift to change who's on it.",
+                    style="color:#868e96;font-size:13px;margin-top:14px;",
                 ),
-                ui.input_action_button("qa_apply", "Assign", class_="btn-primary"),
-                ui.output_ui("qa_note"),
             ),
-        ),
-        ui.nav_panel(
-            "Shifts",
-            ui.card(
-                ui.card_header("Every shift — click a cell to edit"),
-                ui.p("Edits save to shifts.csv when you press Save all changes. "
-                     "Type OPEN for an unfilled shift, CLOSED for a closed day.",
-                     class_="cs-sub"),
-                ui.output_data_frame("grid_shifts"),
-            ),
-        ),
-        ui.nav_panel(
-            "Template & staff",
-            ui.layout_columns(
-                ui.card(
-                    ui.card_header("Staff"),
-                    ui.p("Up to 15. Order sets each person's colour.", class_="cs-sub"),
-                    ui.output_data_frame("grid_staff"),
-                    ui.input_text("new_staff", "Add someone", placeholder="Name"),
-                    ui.input_action_button("add_staff", "Add", class_="btn-sm btn-outline-primary"),
+            ui.nav_panel(
+                tab_label("Shifts", "tabler:list-details"),
+                card(
+                    "Every shift", "tabler:list-details",
+                    alert("Select a row, then press Edit. Everything is chosen from a "
+                          "dropdown — nothing here needs typing.", "",
+                          "tabler:pointer"),
+                    ui.tags.div(
+                        btn("Edit selected", "tabler:edit", "", id="grid_edit"),
+                        btn("Set to OPEN", "tabler:user-off", "default", id="grid_open"),
+                        style="display:flex;gap:8px;margin-bottom:14px;",
+                    ),
+                    ui.output_data_frame("grid_shifts"),
+                    sub="filter with the column boxes",
                 ),
-                ui.card(
-                    ui.card_header("Weekly template"),
-                    ui.p("The regular pattern. Editing here changes nothing until you "
-                         "rebuild a date range below.", class_="cs-sub"),
-                    ui.output_data_frame("grid_template"),
+            ),
+            ui.nav_panel(
+                tab_label("Template", "tabler:template"),
+                ui.tags.div(
+                    card("Staff", "tabler:users",
+                         ui.output_ui("staff_list"),
+                         ui.tags.div(
+                             ui.input_text("new_staff", None, placeholder="Add someone"),
+                             btn("Add", "tabler:plus", "light", id="add_staff"),
+                             style="display:flex;gap:8px;margin-top:12px;align-items:center;",
+                         )),
+                    card("Weekly pattern", "tabler:repeat",
+                         ui.output_ui("template_grid")),
+                    style="display:grid;grid-template-columns:1fr;gap:0;",
                 ),
-                col_widths=[5, 7],
-            ),
-            ui.card(
-                ui.card_header("Rebuild the schedule from the template"),
-                ui.layout_columns(
-                    ui.input_date("gen_from", "From", value=dt.date(2026, 8, 1), weekstart=1),
-                    ui.input_date("gen_to", "To", value=dt.date(2026, 9, 30), weekstart=1),
-                    ui.input_checkbox("keep_manual", "Keep one-day changes", value=True),
-                    col_widths=[4, 4, 4],
+                card(
+                    "Rebuild from the pattern", "tabler:refresh",
+                    ui.tags.div(
+                        ui.input_date("gen_from", "From", value=dt.date(2026, 8, 1), weekstart=1),
+                        ui.input_date("gen_to", "To", value=dt.date(2026, 9, 30), weekstart=1),
+                        ui.input_checkbox("keep_manual", "Keep one-day changes", value=True),
+                        style="display:flex;gap:16px;align-items:flex-end;flex-wrap:wrap;",
+                    ),
+                    ui.tags.div(btn("Rebuild", "tabler:refresh", "", id="gen_go"),
+                                style="margin-top:14px;"),
                 ),
-                ui.input_action_button("gen_go", "Rebuild", class_="btn-primary"),
-                ui.output_ui("gen_note"),
             ),
-        ),
-        ui.nav_panel(
-            "Time off",
-            ui.card(
-                ui.card_header("Time off"),
-                ui.p("Dates as YYYY-MM-DD. Type: Vacation, Sick, Personal or Other.",
-                     class_="cs-sub"),
-                ui.output_data_frame("grid_timeoff"),
-                ui.layout_columns(
-                    ui.input_select("to_staff", "Who", choices=[]),
-                    ui.input_date("to_from", "From", weekstart=1),
-                    ui.input_date("to_to", "To", weekstart=1),
-                    ui.input_select("to_type", "Type",
-                                    choices=["Vacation", "Sick", "Personal", "Other"]),
-                    col_widths=[3, 3, 3, 3],
+            ui.nav_panel(
+                tab_label("Time off", "tabler:beach"),
+                card(
+                    "Book time off", "tabler:beach",
+                    ui.tags.div(
+                        ui.input_select("to_staff", "Who", choices=[]),
+                        ui.input_date("to_from", "From", weekstart=1),
+                        ui.input_date("to_to", "To", weekstart=1),
+                        ui.input_select("to_type", "Type",
+                                        choices=["Vacation", "Sick", "Personal", "Other"]),
+                        style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;",
+                    ),
+                    ui.tags.div(btn("Book it", "tabler:calendar-plus", "", id="to_add"),
+                                style="margin-top:14px;"),
                 ),
-                ui.input_action_button("to_add", "Add and open up those shifts",
-                                       class_="btn-primary"),
-                ui.output_ui("to_note"),
+                card("Booked", "tabler:list", ui.output_data_frame("grid_timeoff")),
+                card("Days used", "tabler:sum", ui.output_data_frame("grid_counts")),
             ),
-            ui.card(
-                ui.card_header("Days used"),
-                ui.output_data_frame("grid_counts"),
+            ui.nav_panel(
+                tab_label("Hours", "tabler:clock-hour-4"),
+                card(
+                    "Hours and potential overtime", "tabler:clock-hour-4",
+                    alert("Over 8 hrs/day, plus over 40 hrs/week counting only the first 8 "
+                          "of each day, credited to the pay period the week ends in. Stat "
+                          "hours are separate. Review only — confirm against BC Employment "
+                          "Standards before paying overtime.", "warn",
+                          "tabler:alert-triangle"),
+                    ui.output_data_frame("grid_hours"),
+                    ui.tags.div(ui.download_button("dl_hours", "Download report"),
+                                style="margin-top:14px;"),
+                ),
+                card("Per person per day", "tabler:table", ui.output_data_frame("grid_daily")),
             ),
+            id="tabs",
         ),
-        ui.nav_panel(
-            "Hours report",
-            ui.card(
-                ui.card_header("Hours and potential overtime by pay period"),
-                ui.p("Potential OT = over 8 hrs/day, plus over 40 hrs/week counting only "
-                     "the first 8 hrs of each day, credited to the pay period the week ends "
-                     "in. Stat hours are listed separately. Review only — confirm against "
-                     "BC Employment Standards before paying OT.", class_="cs-sub"),
-                ui.output_data_frame("grid_hours"),
-                ui.download_button("dl_hours", "Download hours report",
-                                   class_="btn-sm btn-outline-primary mt-2"),
-            ),
-            ui.card(
-                ui.card_header("Hours per person per day"),
-                ui.output_data_frame("grid_daily"),
-            ),
-        ),
-        ui.nav_panel(
-            "Stat holidays",
-            ui.card(
-                ui.card_header("Statutory holidays"),
-                ui.p("BC and national. Used to flag stat hours in the report.",
-                     class_="cs-sub"),
-                ui.output_data_frame("grid_holidays"),
-            ),
-        ),
+        class_="cs-shell",
     ),
-    title="Reception Schedule",
-    fillable=False,
+    ui.tags.div(id="cs-toast", class_="cs-toast"),
 )
 
+# ==========================================================================
+# Google Drive configuration
+# ==========================================================================
+# Paste the OAuth client ID from your Google Cloud project here. Until it is
+# filled in, the Drive button explains what is missing instead of failing.
+# Setup steps are in the README.
 
-# --------------------------------------------------------------------------
-# server
-# --------------------------------------------------------------------------
+DRIVE_CLIENT_ID = ""
+DRIVE_FOLDER_NAME = "Cedar & Sage Schedule"
+
 
 def server(input: Inputs, output: Outputs, session: Session) -> None:
-    # ver  -> bump to force the grids to re-render (load, rebuild, bulk change)
-    # edits-> bump on every cell edit, so downstream reports recompute without
-    #         re-rendering (and thus resetting) the grid being typed into
-    ver = reactive.value(0)
-    edits = reactive.value(0)
-    status = reactive.value(("", True))
+    ver = reactive.value(0)      # bump to re-render grids (load, rebuild)
+    edits = reactive.value(0)    # bump on edits, so reports recompute
+    caps = reactive.value({})
+    monday = reactive.value(monday_of(dt.date(2026, 8, 3)))
+    target = reactive.value(None)
 
     def touch_all() -> None:
         ver.set(ver() + 1)
@@ -717,297 +1129,446 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
     def touch_edit() -> None:
         edits.set(edits() + 1)
 
-    def any_change() -> int:
+    def changed() -> int:
         return ver() + edits()
 
-    # ---------------------------------------------------------------- loading
+    async def persist() -> None:
+        """Autosave into browser storage after every change."""
+        await session.send_custom_message("cs_autosave", {"files": STORE.to_csv_map()})
+
+    # ------------------------------------------------------------ capabilities
+
+    @reactive.effect
+    @reactive.event(input.cs_caps)
+    def _caps() -> None:
+        try:
+            caps.set(json.loads(input.cs_caps()))
+        except Exception:
+            caps.set({})
+
+    @render.ui
+    def conn_status():
+        changed()
+        c = caps()
+        src = STORE.source
+        if src == "drive":
+            dot, label = "on", f"Google Drive · {STORE.folder}"
+        elif src == "folder":
+            dot, label = "on", f"Folder · {STORE.folder}"
+        elif src == "browser":
+            dot, label = "warn", "Restored from this browser — not saved to a file yet"
+        else:
+            dot, label = "", "Example data — open a folder or sign in"
+        return ui.tags.div(
+            ui.tags.span(class_=f"cs-dot {dot}"), label, class_="cs-status",
+        )
+
+    @render.ui
+    def drive_button():
+        cfg = json.dumps({"client_id": DRIVE_CLIENT_ID, "folder_name": DRIVE_FOLDER_NAME})
+        return btn("Google Drive", "tabler:brand-google-drive", "default",
+                   **{"data-cs": "drive-signin", "data-cfg": cfg})
+
+    @render.ui
+    def storage_note():
+        c = caps()
+        if not c:
+            return None
+        bits = []
+        if not c.get("storage"):
+            bits.append(alert(
+                "This browser is blocking local storage, so changes will not survive a "
+                "reload. Save to a folder or Drive as you go.", "warn",
+                "tabler:alert-triangle"))
+        if not c.get("fsa") and not DRIVE_CLIENT_ID:
+            bits.append(alert(
+                "This browser cannot open folders directly (that needs Chrome or Edge), "
+                "and Google Drive is not configured yet. Changes are kept in this browser "
+                "only. See the README to switch on Drive.", "warn",
+                "tabler:folder-off"))
+        return ui.tags.div(*bits) if bits else None
+
+    # ------------------------------------------------------------ load & save
 
     @reactive.effect
     @reactive.event(input.fs_load)
-    def _load_from_folder() -> None:
+    async def _load() -> None:
         payload = json.loads(input.fs_load())
         names = STORE.load_csv_map(payload.get("files", {}))
-        STORE.folder = payload.get("folder", "folder")
-        if names:
-            status.set((f"Loaded {', '.join(names)} from {STORE.folder}.", True))
-        else:
-            status.set((f"No recognised CSVs in {STORE.folder}. "
-                        "Press Save all changes to write a fresh set there.", False))
+        STORE.folder = payload.get("folder", "?")
+        STORE.source = payload.get("source", "folder")
         touch_all()
-
-    @reactive.effect
-    @reactive.event(input.upload)
-    def _load_from_upload() -> None:
-        blob: dict[str, str] = {}
-        for f in input.upload() or []:
-            try:
-                with open(f["datapath"], "r", encoding="utf-8") as fh:
-                    blob[f["name"]] = fh.read()
-            except Exception:
-                continue
-        names = STORE.load_csv_map(blob)
-        STORE.folder = "(uploaded files)"
-        status.set((f"Loaded {', '.join(names)}." if names
-                    else "Those files didn't match any expected name.", bool(names)))
-        touch_all()
-
-    @reactive.effect
-    @reactive.event(input.fs_status)
-    def _fs_status() -> None:
-        msg = json.loads(input.fs_status())
-        status.set((msg.get("msg", ""), msg.get("ok", False)))
-
-    # ---------------------------------------------------------------- saving
+        if STORE.source != "browser":
+            await persist()
 
     @reactive.effect
     @reactive.event(input.btn_save)
     async def _save() -> None:
         await session.send_custom_message("cs_save", {"files": STORE.to_csv_map()})
 
-    @render.ui
-    def folder_note():
-        return ui.p(f"Folder: {STORE.folder}", class_="cs-sub mt-2")
+    # ------------------------------------------------------------ week nav
 
-    @render.ui
-    def save_note():
-        any_change()
-        msg, ok = status()
-        if not msg:
-            return ui.p("Nothing saved yet this session.", class_="cs-sub")
-        return ui.p(msg, class_="cs-ok" if ok else "cs-flag")
+    @reactive.effect
+    @reactive.event(input.wk_prev)
+    def _prev() -> None:
+        monday.set(monday() - dt.timedelta(days=7))
 
-    # ---------------------------------------------------------------- week view
+    @reactive.effect
+    @reactive.event(input.wk_next)
+    def _next() -> None:
+        monday.set(monday() + dt.timedelta(days=7))
+
+    @reactive.effect
+    @reactive.event(input.wk_today)
+    def _today() -> None:
+        monday.set(monday_of(dt.date.today()))
 
     @reactive.calc
     def week_days() -> list[dt.date]:
-        base = input.week_of() or dt.date(2026, 8, 3)
-        start = monday_of(base)
-        return [start + dt.timedelta(days=i) for i in range(5)]
+        return [monday() + dt.timedelta(days=i) for i in range(5)]
 
     @render.text
     def week_header() -> str:
-        days = week_days()
-        return f"Week of {fmt_long(days[0])}"
+        d = week_days()
+        return f"{fmt_short(d[0])} – {fmt_long(d[4])}"
+
+    def shift_index() -> dict[tuple[str, str], Any]:
+        out = {}
+        for _, r in STORE.data["shifts.csv"].iterrows():
+            out[(str(r["date"]).strip(), str(r["shift"]).strip().upper())] = r
+        return out
 
     @render.ui
     def week_view():
-        any_change()
-        days = week_days()
+        changed()
+        monday()
         staff = STORE.staff_names()
         holidays = STORE.holiday_set()
         hol_names = {parse_date(r["date"]): r["name"]
                      for _, r in STORE.data["holidays.csv"].iterrows()
                      if parse_date(r["date"])}
-        shifts = STORE.data["shifts.csv"]
+        idx = shift_index()
+        today = dt.date.today()
 
-        index: dict[tuple[str, str], dict[str, str]] = {}
-        for _, r in shifts.iterrows():
-            index[(str(r["date"]).strip(), str(r["shift"]).strip().upper())] = r
-
-        rows = []
-        for d in days:
-            is_stat = d in holidays
+        cards = []
+        for d in week_days():
+            stat = d in holidays
+            slots = []
             for sh in SHIFTS:
-                rec = index.get((d.isoformat(), sh))
-                who = str(rec["staff"]).strip() if rec is not None else ""
+                rec = idx.get((d.isoformat(), sh))
+                who = str(rec["staff"]).strip() if rec is not None else OPEN
+                who = who or OPEN
                 times = (f"{rec['start']} – {rec['end']}"
-                         if rec is not None and rec["start"] else "")
-                pill_class = "cs-pill open" if who in ("", OPEN) else "cs-pill"
-                style = "" if who in ("", OPEN) else f"background:{colour_for(who, staff)}"
-                label = who if who else OPEN
-                first = sh == "AM"
-                rows.append(
-                    ui.tags.tr(
-                        ui.tags.td(
-                            ui.tags.div(fmt_day(d), class_="cs-day") if first else "",
-                            ui.tags.div(hol_names.get(d, ""), class_="cs-statname")
-                            if first and is_stat else "",
-                        ),
-                        ui.tags.td(sh, class_="cs-tag"),
-                        ui.tags.td(ui.tags.span(label, class_=pill_class, style=style)),
-                        ui.tags.td(times),
-                        class_="stat" if is_stat else "",
-                    )
-                )
-        return ui.tags.table(ui.tags.tbody(*rows), class_="cs-week")
+                         if rec is not None and str(rec["start"]).strip() else "")
+                if who == OPEN:
+                    badge = ui.tags.span("Open", class_="m-badge open")
+                elif who == CLOSED:
+                    badge = ui.tags.span("Closed", class_="m-badge closed")
+                else:
+                    badge = ui.tags.span(
+                        who, class_="m-badge",
+                        style=f"background:{colour_for(who, staff)}")
+                slots.append(ui.tags.div(
+                    ui.tags.span(sh, class_="lab"),
+                    ui.tags.div(badge, ui.tags.div(times, class_="cs-times")),
+                    ui.tags.span(icon("tabler:pencil"), class_="edit"),
+                    class_="cs-slot",
+                    **{"data-cs": "shift", "data-date": d.isoformat(), "data-shift": sh},
+                ))
+            klass = "cs-day"
+            if d == today:
+                klass += " today"
+            if stat:
+                klass += " stat"
+            cards.append(ui.tags.div(
+                ui.tags.div(
+                    ui.tags.div(f"{d:%A}", class_="cs-dow"),
+                    ui.tags.div(fmt_short(d), class_="cs-dnum"),
+                    ui.tags.div(hol_names.get(d, ""), class_="cs-stat-name") if stat else None,
+                    class_="cs-day-head",
+                ),
+                *slots,
+                class_=klass,
+            ))
+        return ui.tags.div(*cards, class_="cs-days")
 
-    # ------------------------------------------------------- select choices
+    # ------------------------------------------------------- the shift editor
 
-    @reactive.effect
-    def _refresh_choices() -> None:
-        any_change()
+    def open_editor(date_iso: str, shift: str) -> None:
         staff = STORE.staff_names()
-        days = week_days()
-        ui.update_select(
-            "qa_date",
-            choices={d.isoformat(): fmt_day(d) for d in days},
-        )
-        ui.update_select("qa_staff", choices=[OPEN] + staff + [CLOSED])
-        ui.update_select("to_staff", choices=staff)
+        idx = shift_index()
+        rec = idx.get((date_iso, shift))
+        cur = str(rec["staff"]).strip() if rec is not None else OPEN
+        d = parse_date(date_iso)
+        start = (str(rec["start"]).strip() if rec is not None and str(rec["start"]).strip()
+                 else DEFAULT_TIMES[shift][0])
+        end = (str(rec["end"]).strip() if rec is not None and str(rec["end"]).strip()
+               else DEFAULT_TIMES[shift][1])
+        target.set({"date": date_iso, "shift": shift})
+        weekday = WEEKDAYS[d.weekday()] if d and d.weekday() < 5 else None
 
-    # ---------------------------------------------------------- quick assign
+        scope = {"once": "Just this day"}
+        if weekday:
+            scope["weekly"] = f"Every {d:%A}"
+
+        ui.modal_show(ui.modal(
+            ui.input_select("m_staff", "Who's working",
+                            choices=[OPEN, CLOSED] + staff,
+                            selected=cur if cur in ([OPEN, CLOSED] + staff) else OPEN),
+            ui.tags.div(
+                ui.input_select("m_start", "Start", choices=TIME_CHOICES, selected=start),
+                ui.input_select("m_end", "End", choices=TIME_CHOICES, selected=end),
+                style="display:grid;grid-template-columns:1fr 1fr;gap:14px;",
+            ),
+            ui.input_radio_buttons("m_scope", "Apply to", choices=scope, selected="once"),
+            title=f"{shift} shift · {fmt_day(d) if d else date_iso}",
+            footer=ui.tags.div(
+                ui.modal_button("Cancel", class_="m-btn subtle"),
+                btn("Save", "tabler:check", "", id="m_save"),
+                style="display:flex;gap:8px;justify-content:flex-end;",
+            ),
+            easy_close=True,
+        ))
 
     @reactive.effect
-    @reactive.event(input.qa_apply)
-    def _quick_assign() -> None:
-        date_s = input.qa_date()
-        shift_s = input.qa_shift()
-        who = input.qa_staff()
-        if not date_s or not shift_s:
+    @reactive.event(input.cell_click)
+    def _cell_click() -> None:
+        payload = json.loads(input.cell_click())
+        open_editor(payload["date"], payload["shift"])
+
+    @reactive.effect
+    @reactive.event(input.grid_edit)
+    def _grid_edit() -> None:
+        rows = list(grid_shifts.data_view_rows() or [])
+        sel = grid_shifts.input_cell_selection()
+        picked = list(sel.get("rows", [])) if sel else []
+        if not picked:
+            ui.notification_show("Select a row first.", type="warning")
             return
         df = STORE.data["shifts.csv"]
-        mask = (df["date"] == date_s) & (df["shift"].str.upper() == shift_s)
-        start = input.qa_start().strip() or DEFAULT_TIMES[shift_s][0]
-        end = input.qa_end().strip() or DEFAULT_TIMES[shift_s][1]
+        src = rows[picked[0]] if picked[0] < len(rows) else picked[0]
+        row = df.iloc[src]
+        open_editor(str(row["date"]).strip(), str(row["shift"]).strip().upper())
+
+    def write_shift(date_iso: str, shift: str, who: str,
+                    start: str, end: str) -> None:
+        df = STORE.data["shifts.csv"]
+        mask = (df["date"] == date_iso) & (df["shift"].str.upper() == shift)
         if mask.any():
             df.loc[mask, ["staff", "start", "end"]] = [who, start, end]
         else:
             STORE.data["shifts.csv"] = pd.concat(
-                [df, pd.DataFrame([{"date": date_s, "shift": shift_s, "staff": who,
+                [df, pd.DataFrame([{"date": date_iso, "shift": shift, "staff": who,
                                     "start": start, "end": end}])],
                 ignore_index=True,
-            )
-        status.set((f"{who} set for {date_s} {shift_s}. Not saved to disk yet.", True))
+            ).sort_values(["date", "shift"]).reset_index(drop=True)
+
+    @reactive.effect
+    @reactive.event(input.m_save)
+    async def _modal_save() -> None:
+        t = target()
+        if not t:
+            return
+        who = input.m_staff()
+        start, end = input.m_start(), input.m_end()
+        write_shift(t["date"], t["shift"], who, start, end)
+
+        if input.m_scope() == "weekly" and who not in (OPEN, CLOSED):
+            d = parse_date(t["date"])
+            wd = WEEKDAYS[d.weekday()]
+            tmpl = STORE.data["template.csv"]
+            m = (tmpl["weekday"] == wd) & (tmpl["shift"] == t["shift"])
+            if m.any():
+                tmpl.loc[m, "staff"] = who
+            else:
+                STORE.data["template.csv"] = pd.concat(
+                    [tmpl, pd.DataFrame([{"weekday": wd, "shift": t["shift"], "staff": who}])],
+                    ignore_index=True)
+            # push it across every future date that still follows the pattern
+            for i, r in STORE.data["shifts.csv"].iterrows():
+                rd = parse_date(r["date"])
+                if rd and rd >= d and rd.weekday() == d.weekday() \
+                        and str(r["shift"]).upper() == t["shift"]:
+                    STORE.data["shifts.csv"].at[i, "staff"] = who
+
+        ui.modal_remove()
         touch_all()
+        await persist()
 
-    @render.ui
-    def qa_note():
-        any_change()
-        return ui.p("Changes live in the browser until you press Save all changes.",
-                    class_="cs-sub")
+    @reactive.effect
+    @reactive.event(input.grid_open)
+    async def _grid_open() -> None:
+        sel = grid_shifts.input_cell_selection()
+        picked = list(sel.get("rows", [])) if sel else []
+        if not picked:
+            ui.notification_show("Select a row first.", type="warning")
+            return
+        rows = list(grid_shifts.data_view_rows() or [])
+        df = STORE.data["shifts.csv"]
+        for p in picked:
+            src = rows[p] if p < len(rows) else p
+            df.iat[src, df.columns.get_loc("staff")] = OPEN
+        touch_all()
+        await persist()
 
-    # ---------------------------------------------------------------- grids
-
-    def editable(name: str, height: str = "460px"):
-        return render.DataGrid(STORE.data[name], editable=True, filters=True, height=height)
-
-    def bind_edits(grid_obj, name: str) -> None:
-        """Write cell edits straight into the store, keeping column order."""
-        @grid_obj.set_patches_fn
-        def _(*, patches):
-            df = STORE.data[name]
-            cols = list(df.columns)
-            view_rows = grid_obj.data_view_rows()
-            for p in patches:
-                try:
-                    src = view_rows[p["row_index"]]
-                except (IndexError, TypeError):
-                    src = p["row_index"]
-                if 0 <= src < len(df) and 0 <= p["column_index"] < len(cols):
-                    df.iat[src, p["column_index"]] = str(p["value"]).strip()
-            touch_edit()
-            return patches
+    # ------------------------------------------------------------ grids
 
     @render.data_frame
     def grid_shifts():
         ver()
-        return editable("shifts.csv", "560px")
-
-    bind_edits(grid_shifts, "shifts.csv")
-
-    @render.data_frame
-    def grid_staff():
-        ver()
-        return editable("staff.csv", "260px")
-
-    bind_edits(grid_staff, "staff.csv")
-
-    @render.data_frame
-    def grid_template():
-        ver()
-        return editable("template.csv", "260px")
-
-    bind_edits(grid_template, "template.csv")
+        return render.DataGrid(STORE.data["shifts.csv"], filters=True,
+                               height="520px", selection_mode="rows")
 
     @render.data_frame
     def grid_timeoff():
-        ver()
-        return editable("timeoff.csv", "300px")
+        changed()
+        return render.DataGrid(STORE.data["timeoff.csv"], height="240px")
 
-    bind_edits(grid_timeoff, "timeoff.csv")
+    # ------------------------------------------------------- staff & template
 
-    @render.data_frame
-    def grid_holidays():
-        ver()
-        return editable("holidays.csv", "400px")
+    @render.ui
+    def staff_list():
+        changed()
+        names = STORE.staff_names()
+        if not names:
+            return ui.tags.p("Nobody yet.", style="color:#868e96;font-size:13px;")
+        pills = [ui.tags.span(n, class_="m-badge",
+                              style=f"background:{colour_for(n, names)};margin:0 6px 6px 0;")
+                 for n in names]
+        return ui.tags.div(
+            ui.tags.div(*pills, style="display:flex;flex-wrap:wrap;"),
+            ui.tags.div(
+                ui.input_select("rm_staff", None, choices=[""] + names),
+                btn("Remove", "tabler:trash", "default", id="del_staff"),
+                style="display:flex;gap:8px;margin-top:10px;align-items:center;",
+            ),
+        )
 
-    bind_edits(grid_holidays, "holidays.csv")
+    @render.ui
+    def template_grid():
+        changed()
+        names = STORE.staff_names()
+        tmpl = {}
+        for _, r in STORE.data["template.csv"].iterrows():
+            tmpl[(str(r["weekday"]).strip(), str(r["shift"]).strip().upper())] = \
+                str(r["staff"]).strip()
+        cols = []
+        for wd in WEEKDAYS:
+            fields = []
+            for sh in SHIFTS:
+                cur = tmpl.get((wd, sh), "")
+                fields.append(ui.input_select(
+                    f"tmpl_{wd}_{sh}", sh, choices=[OPEN] + names,
+                    selected=cur if cur in names else OPEN))
+            cols.append(ui.tags.div(
+                ui.tags.div(wd, style="font-weight:600;font-size:13px;margin-bottom:6px;"),
+                *fields,
+            ))
+        return ui.tags.div(
+            *cols,
+            style="display:grid;grid-template-columns:repeat(5,minmax(140px,1fr));gap:12px;overflow-x:auto;",
+        )
 
-    # ------------------------------------------------------------ staff add
+    @reactive.effect
+    async def _sync_template() -> None:
+        names = STORE.staff_names()
+        rows = []
+        for wd in WEEKDAYS:
+            for sh in SHIFTS:
+                try:
+                    val = input[f"tmpl_{wd}_{sh}"]()
+                except Exception:
+                    return
+                rows.append({"weekday": wd, "shift": sh,
+                             "staff": "" if val in (OPEN, None) else str(val)})
+        new = pd.DataFrame(rows, columns=SCHEMAS["template.csv"])
+        with reactive.isolate():
+            if not new.equals(STORE.data["template.csv"]):
+                STORE.data["template.csv"] = new
+                touch_edit()
+                await persist()
 
     @reactive.effect
     @reactive.event(input.add_staff)
-    def _add_staff() -> None:
-        name = input.new_staff().strip()
+    async def _add_staff() -> None:
+        name = (input.new_staff() or "").strip()
         if not name:
             return
         df = STORE.data["staff.csv"]
         if name in df["name"].tolist():
-            status.set((f"{name} is already on the list.", False))
+            ui.notification_show(f"{name} is already listed.", type="warning")
             return
         if len(df) >= 15:
-            status.set(("That's 15 people — the colour palette stops there.", False))
+            ui.notification_show("That's 15 people — the colour palette stops there.",
+                                 type="warning")
             return
-        STORE.data["staff.csv"] = pd.concat(
-            [df, pd.DataFrame([{"name": name}])], ignore_index=True)
+        STORE.data["staff.csv"] = pd.concat([df, pd.DataFrame([{"name": name}])],
+                                            ignore_index=True)
         ui.update_text("new_staff", value="")
-        status.set((f"Added {name}.", True))
         touch_all()
+        await persist()
 
-    # ------------------------------------------------------------- rebuild
+    @reactive.effect
+    @reactive.event(input.del_staff)
+    async def _del_staff() -> None:
+        name = input.rm_staff()
+        if not name:
+            return
+        df = STORE.data["staff.csv"]
+        STORE.data["staff.csv"] = df[df["name"] != name].reset_index(drop=True)
+        touch_all()
+        await persist()
+
+    @reactive.effect
+    def _staff_choices() -> None:
+        changed()
+        ui.update_select("to_staff", choices=STORE.staff_names())
+
+    # ------------------------------------------------------------ rebuild
 
     @reactive.effect
     @reactive.event(input.gen_go)
-    def _rebuild() -> None:
+    async def _rebuild() -> None:
         a, b = input.gen_from(), input.gen_to()
         if not a or not b or b < a:
-            status.set(("Check the date range — the end is before the start.", False))
+            ui.notification_show("The end date is before the start date.", type="warning")
             return
         STORE.data["shifts.csv"] = build_shifts(
             a, b, STORE.data["template.csv"], STORE.data["timeoff.csv"],
             existing=STORE.data["shifts.csv"], keep_manual=bool(input.keep_manual()),
         )
-        status.set((f"Rebuilt {fmt_short(a)} to {fmt_short(b)} from the template. Not saved yet.", True))
+        ui.notification_show(f"Rebuilt {fmt_short(a)} to {fmt_short(b)}.", type="message")
         touch_all()
+        await persist()
 
-    @render.ui
-    def gen_note():
-        any_change()
-        n = len(STORE.data["shifts.csv"])
-        return ui.p(f"{n} shift rows currently loaded.", class_="cs-sub")
-
-    # ------------------------------------------------------------- time off
+    # ------------------------------------------------------------ time off
 
     @reactive.effect
     @reactive.event(input.to_add)
-    def _add_timeoff() -> None:
+    async def _add_timeoff() -> None:
         who, a, b = input.to_staff(), input.to_from(), input.to_to()
         if not who or not a or not b:
-            status.set(("Pick a person and both dates.", False))
+            ui.notification_show("Pick a person and both dates.", type="warning")
             return
         if b < a:
-            status.set(("The end date is before the start date.", False))
+            ui.notification_show("The end date is before the start date.", type="warning")
             return
         STORE.data["timeoff.csv"] = pd.concat(
             [STORE.data["timeoff.csv"],
              pd.DataFrame([{"staff": who, "start": a.isoformat(), "end": b.isoformat(),
                             "type": input.to_type(), "note": ""}])],
-            ignore_index=True,
-        )
+            ignore_index=True)
         STORE.data["shifts.csv"], hits = apply_timeoff(
             STORE.data["shifts.csv"], STORE.data["timeoff.csv"])
-        status.set((f"{who} off {fmt_short(a)} to {fmt_short(b)}. {hits} shift(s) opened up.", True))
+        ui.notification_show(
+            f"{who} off {fmt_short(a)}–{fmt_short(b)}. {hits} shift(s) opened up.",
+            type="message")
         touch_all()
-
-    @render.ui
-    def to_note():
-        any_change()
-        return ui.p("Adding time off opens up that person's shifts in the range.",
-                    class_="cs-sub")
+        await persist()
 
     @render.data_frame
     def grid_counts():
-        any_change()
+        changed()
         rows = []
         for who in STORE.staff_names():
             tally: dict[str, float] = {}
@@ -1021,52 +1582,32 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
                            if (a + dt.timedelta(days=i)).weekday() < 5)
                 kind = str(r["type"]).strip() or "Other"
                 tally[kind] = tally.get(kind, 0) + days
-            rows.append({
-                "staff": who,
-                "vacation days": tally.get("Vacation", 0),
-                "sick days": tally.get("Sick", 0),
-                "personal days": tally.get("Personal", 0),
-                "other": tally.get("Other", 0),
-            })
-        return render.DataGrid(pd.DataFrame(rows), height="220px")
+            rows.append({"staff": who, "vacation": tally.get("Vacation", 0),
+                         "sick": tally.get("Sick", 0), "personal": tally.get("Personal", 0),
+                         "other": tally.get("Other", 0)})
+        return render.DataGrid(pd.DataFrame(rows), height="200px")
 
-    # ---------------------------------------------------------------- hours
+    # ------------------------------------------------------------ hours
 
     @reactive.calc
     def hours_df() -> pd.DataFrame:
-        any_change()
+        changed()
         return overtime(STORE.data["shifts.csv"], STORE.staff_names(), STORE.holiday_set())
 
     @render.data_frame
     def grid_hours():
-        return render.DataGrid(hours_df(), height="420px", filters=True)
+        return render.DataGrid(hours_df(), height="380px", filters=True)
 
     @render.data_frame
     def grid_daily():
-        any_change()
+        changed()
         return render.DataGrid(
             hours_table(STORE.data["shifts.csv"], STORE.staff_names()),
-            height="420px", filters=True,
-        )
-
-    # ------------------------------------------------------------ downloads
-
-    @render.download_button(filename="shifts.csv")
-    def dl_shifts():
-        yield STORE.data["shifts.csv"].to_csv(index=False)
+            height="380px", filters=True)
 
     @render.download_button(filename="hours-report.csv")
     def dl_hours():
         yield hours_df().to_csv(index=False)
-
-    @render.download_button(filename="reception-schedule-all.csv")
-    def dl_all():
-        buf = io.StringIO()
-        for name, df in STORE.data.items():
-            buf.write(f"# {name}\n")
-            buf.write(df.to_csv(index=False))
-            buf.write("\n")
-        yield buf.getvalue()
 
 
 app = App(app_ui, server)
