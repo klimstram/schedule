@@ -1174,7 +1174,7 @@ app_ui = ui.page_fluid(
 # filled in, the Drive button explains what is missing instead of failing.
 # Setup steps are in the README.
 
-GOOGLE_CLIENT_ID = ""   # OAuth client ID from your Google Cloud project
+GOOGLE_CLIENT_ID = "257753211926-n9amjiarhchvaddfufj97ldntfp9nqbs.apps.googleusercontent.com"
 
 
 def server(input: Inputs, output: Outputs, session: Session) -> None:

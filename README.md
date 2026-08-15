@@ -2,20 +2,20 @@
 
 A staff scheduling app for Cedar & Sage Physiotherapy. It runs entirely in the
 browser (Shiny for Python compiled to WebAssembly via shinylive), is hosted for
-free on GitHub Pages, and keeps the schedule in plain CSV files — in browser
-storage, in a folder on disk, or in Google Drive.
+free on GitHub Pages, and keeps the schedule in a Google Sheet — one tab per
+table, shared with staff the ordinary way.
 
 The interface follows Mantine's design language with Tabler icons via Iconify.
 Dash Mantine Components itself is a Dash library and cannot run inside Shiny,
 so the tokens, radii, shadows and spacing are reproduced in CSS.
 
-There is no server and no database. Nothing about the schedule ever leaves the
-clinic's own machines: the page is static, and the staff data lives only in the
-CSVs the user opens.
+There is no server of our own and no database. The page is static; the schedule
+lives in the clinic's own Google Sheet, under the clinic's own Google account,
+reached directly from the browser.
 
 ## Running it
 
-**Live:** https://YOUR-USERNAME.github.io/schedule/ (once Pages is switched on)
+**Live:** https://klimstram.github.io/schedule/ (once Pages is switched on)
 
 The built site is committed to [`docs/`](docs) and served straight from `main` —
 no CI required. `docs/app.json` is the bundle that holds `app.py` and the CSVs;
@@ -81,8 +81,8 @@ than an empty grid.
 > URL — personal information the clinic is responsible for under BC PIPA.
 >
 > Treat `app/data/` as the demo skeleton: the roster shape, the statutory
-> holidays, placeholder names. The real schedule lives in the Drive folder that
-> staff open with **Open schedule folder** at runtime, and never touches git.
+> holidays, placeholder names. The real schedule lives in the Google Sheet,
+> loaded at runtime, and never touches git.
 >
 > If you do want real data to load by default, the repo has to be private and
 > Pages needs a paid GitHub plan, since Pages from a private repo isn't on the
@@ -109,10 +109,12 @@ starting point.
    it stays in *Testing* you list each staff member under **Test users** — up to
    100, and no Google verification is needed.
 4. **Credentials → Create credentials → OAuth client ID →** Web application.
-   Under **Authorised JavaScript origins** add your Pages origin exactly, with
-   no trailing slash: `https://YOUR-USERNAME.github.io`. Add
-   `http://localhost:8000` as well if you want it working while developing.
+   Under **Authorised JavaScript origins** add the origin exactly — host only,
+   no `/schedule`, no trailing slash: `https://klimstram.github.io`. Add
+   `http://localhost:8000` as well for local development.
 5. Paste the client ID into `GOOGLE_CLIENT_ID` in `app/app.py`, re-export, push.
+   It is already filled in. The client ID is public by design, so keeping it in
+   this repo is fine — there is no client *secret* in this flow.
 
 The scope is `spreadsheets`. Share the sheet with staff the normal way — anyone
 with edit access on the sheet can save from the app, anyone with view access can
