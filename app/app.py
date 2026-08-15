@@ -640,7 +640,8 @@ BROWSER_JS = r"""
     });
   }
 
-  var API = "https://sheets.googleapis.com/v4/spreadsheets/";
+  var API_BASE = "https://sheets.googleapis.com/v4/spreadsheets";
+  var API = API_BASE + "/";
 
   function signIn(cfg) {
     return loadScript("https://accounts.google.com/gsi/client").then(function () {
@@ -678,7 +679,8 @@ BROWSER_JS = r"""
       files[want[i] + ".csv"] = toCsv(vr.values || []);
     });
     send("fs_load", JSON.stringify({
-      folder: "Google Sheet", files: files, source: "sheet"
+      folder: "Google Sheet", files: files, source: "sheet",
+      url: "https://docs.google.com/spreadsheets/d/" + sheetId + "/edit"
     }));
   }
 
@@ -710,6 +712,34 @@ BROWSER_JS = r"""
     });
   }
 
+  async function sheetCreate(cfg) {
+    if (!cfg.client_id) {
+      toast("No Google client ID configured yet — see the README.", "warn");
+      return;
+    }
+    try {
+      sheetToken = await signIn(cfg);
+      var made = await (await gfetch(API_BASE, {
+        method: "POST",
+        body: JSON.stringify({
+          properties: { title: cfg.title || "Reception Schedule" },
+          sheets: TABS.map(function (t) { return { properties: { title: t } }; })
+        })
+      })).json();
+      sheetId = made.spreadsheetId;
+      var url = made.spreadsheetUrl ||
+                ("https://docs.google.com/spreadsheets/d/" + sheetId + "/edit");
+      try { localStorage.setItem(SHEET_KEY, url); } catch (e) {}
+      var box = document.getElementById("sheet_url");
+      if (box) box.value = url;
+      // hand back to Shiny, which replies with cs_save to fill the new tabs
+      send("sheet_created", JSON.stringify({ id: sheetId, url: url }));
+      toast("Sheet created — writing the schedule into it…", "ok");
+    } catch (e) {
+      toast("Could not create the sheet: " + (e && e.message ? e.message : e), "error");
+    }
+  }
+
   async function sheetConnect(cfg) {
     var input = document.getElementById("sheet_url");
     var url = input ? input.value : "";
@@ -738,6 +768,13 @@ BROWSER_JS = r"""
     var action = el.getAttribute("data-cs");
 
     if (action === "open-folder") { openFolder(); return; }
+
+    if (action === "sheet-new") {
+      var ncfg = {};
+      try { ncfg = JSON.parse(el.getAttribute("data-cfg") || "{}"); } catch (e) {}
+      sheetCreate(ncfg);
+      return;
+    }
 
     if (action === "sheet-connect") {
       var cfg = {};
@@ -1054,7 +1091,7 @@ app_ui = ui.page_fluid(
         ui.tags.div(
         ui.tags.input(
             id="sheet_url", type="text", class_="form-control",
-            placeholder="Paste your Google Sheet link once",
+            placeholder="Google Sheet link — or press New sheet",
             style="min-width:280px;height:36px;font-size:13px;",
         ),
         style="margin-left:auto;",
@@ -1181,6 +1218,7 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
     ver = reactive.value(0)      # bump to re-render grids (load, rebuild)
     edits = reactive.value(0)    # bump on edits, so reports recompute
     caps = reactive.value({})
+    sheet_url = reactive.value("")
     monday = reactive.value(monday_of(dt.date(2026, 8, 3)))
     target = reactive.value(None)
 
@@ -1213,7 +1251,12 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
         c = caps()
         src = STORE.source
         if src == "sheet":
-            dot, label = "on", "Google Sheet — saving there"
+            url = sheet_url()
+            body = (ui.tags.a("Google Sheet", href=url, target="_blank",
+                              style="color:inherit;")
+                    if url else "Google Sheet")
+            return ui.tags.div(ui.tags.span(class_="cs-dot on"),
+                               body, " — saving there", class_="cs-status")
         elif src == "folder":
             dot, label = "on", f"Folder · {STORE.folder}"
         elif src == "browser":
@@ -1226,9 +1269,15 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
 
     @render.ui
     def drive_button():
-        cfg = json.dumps({"client_id": GOOGLE_CLIENT_ID})
-        return btn("Connect Sheet", "tabler:table-share", "default",
-                   **{"data-cs": "sheet-connect", "data-cfg": cfg})
+        cfg = json.dumps({"client_id": GOOGLE_CLIENT_ID,
+                          "title": "Cedar & Sage Reception Schedule"})
+        return ui.tags.div(
+            btn("New sheet", "tabler:table-plus", "light",
+                **{"data-cs": "sheet-new", "data-cfg": cfg}),
+            btn("Connect", "tabler:table-share", "default",
+                **{"data-cs": "sheet-connect", "data-cfg": cfg}),
+            style="display:flex;gap:8px;",
+        )
 
     @render.ui
     def storage_note():
@@ -1258,6 +1307,8 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
         names = STORE.load_csv_map(payload.get("files", {}))
         STORE.folder = payload.get("folder", "?")
         STORE.source = payload.get("source", "folder")
+        if payload.get("url"):
+            sheet_url.set(payload["url"])
         touch_all()
         if STORE.source != "browser":
             await persist()
@@ -1267,6 +1318,16 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
     def _sheet_ready() -> None:
         STORE.source = "sheet"
         touch_all()
+
+    @reactive.effect
+    @reactive.event(input.sheet_created)
+    async def _sheet_created() -> None:
+        payload = json.loads(input.sheet_created())
+        STORE.source = "sheet"
+        sheet_url.set(payload.get("url", ""))
+        touch_all()
+        # the sheet exists but is empty — push what we have into it
+        await session.send_custom_message("cs_save", {"files": STORE.to_csv_map()})
 
     @reactive.effect
     @reactive.event(input.btn_save)

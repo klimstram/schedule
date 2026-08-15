@@ -93,13 +93,22 @@ than an empty grid.
 ### Using a Google Sheet (recommended)
 
 One spreadsheet holds everything, one tab per table: `staff`, `template`,
-`shifts`, `timeoff`, `holidays`. Paste its link into the box in the header once
-and the app remembers it. Reading and writing both go through the Sheets API, so
-the sheet's own sharing settings decide who can edit, and every change is
+`shifts`, `timeoff`, `holidays`. Reading and writing both go through the Sheets
+API, so the sheet's own sharing settings decide who can edit, and every change is
 attributed in its version history.
 
-Missing tabs are created on the first save, so an empty spreadsheet is a fine
-starting point.
+Two ways to get started, both in the header:
+
+- **New sheet** — the app creates the spreadsheet for you, with all five tabs,
+  and writes the current schedule into it. Nothing to paste. Afterwards the
+  status line links straight to it, so you can open it in Google Sheets and
+  share it with staff the normal way.
+- **Connect** — for a spreadsheet that already exists: paste its link in the box
+  first. Missing tabs are created on the first save, so an empty spreadsheet is
+  a fine starting point.
+
+Either way the link is remembered in browser storage, so it is a one-time step
+per device.
 
 **One-time Google Cloud setup, about ten minutes:**
 
