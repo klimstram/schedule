@@ -119,6 +119,13 @@ Two ways to get started, both in the header:
 Either way the link is remembered in browser storage, so it is a one-time step
 per device.
 
+**Sign-in is per device and per browser session.** The sheet link persists, but
+the Google access token does not — it lasts about an hour and is never written to
+disk. So on a phone, or after leaving the app for a while, tap **Connect** once
+before saving. The app says so plainly: the status line reads "Sheet remembered —
+tap Connect to sign in on this device", and pressing Save without a token warns
+instead of silently keeping the change in the browser.
+
 **One-time Google Cloud setup, about ten minutes:**
 
 1. [console.cloud.google.com](https://console.cloud.google.com) → create a project.

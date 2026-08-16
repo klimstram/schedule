@@ -489,6 +489,8 @@ BROWSER_JS = r"""
   var dirHandle = null;
   var queue = [];
   var SHEET_KEY = "cedarsage.sheeturl";
+  var GSI_SRC = "https://accounts.google.com/gsi/client";
+  var gsiPromise = null;
   var sheetToken = null;
   var sheetId = null;
 
@@ -527,7 +529,11 @@ BROWSER_JS = r"""
       secure: !!window.isSecureContext,
       storage: storage,
       framed: window.top !== window.self,
-      origin: location.origin
+      origin: location.origin,
+      sheetLinked: !!(function () {
+        try { return localStorage.getItem(SHEET_KEY); } catch (e) { return null; }
+      })(),
+      signedIn: !!sheetToken
     };
   }
 
@@ -658,18 +664,23 @@ BROWSER_JS = r"""
   var API = API_BASE + "/";
 
   function signIn(cfg) {
-    return loadScript("https://accounts.google.com/gsi/client").then(function () {
-      return new Promise(function (resolve, reject) {
-        var tc = google.accounts.oauth2.initTokenClient({
-          client_id: cfg.client_id,
-          scope: "https://www.googleapis.com/auth/spreadsheets",
-          callback: function (r) {
-            if (r.error) reject(new Error(r.error));
-            else resolve(r.access_token);
-          }
-        });
-        tc.requestAccessToken({ prompt: sheetToken ? "" : "consent" });
+    // No await before requestAccessToken: on iOS Safari, awaiting first breaks
+    // transient user activation and the sign-in popup is blocked with no error.
+    // The script is preloaded at startup instead.
+    return new Promise(function (resolve, reject) {
+      if (!(window.google && google.accounts && google.accounts.oauth2)) {
+        reject(new Error("Google sign-in hasn't finished loading — wait a moment and tap again."));
+        return;
+      }
+      var tc = google.accounts.oauth2.initTokenClient({
+        client_id: cfg.client_id,
+        scope: "https://www.googleapis.com/auth/spreadsheets",
+        callback: function (r) {
+          if (r.error) reject(new Error(r.error));
+          else resolve(r.access_token);
+        }
       });
+      tc.requestAccessToken({ prompt: "" });
     });
   }
 
@@ -819,6 +830,9 @@ BROWSER_JS = r"""
         } else if (dirHandle) {
           await writeFolder(files);
           toast("Saved to " + dirHandle.name + ".", "ok");
+        } else if (sheetId) {
+          // the sheet is remembered but this session has no token yet
+          toast("Not signed in on this device — tap Connect, then Save again.", "warn");
         } else {
           toast("Kept in this browser. Connect a Google Sheet to save it there.", "info");
         }
@@ -853,8 +867,14 @@ BROWSER_JS = r"""
     try {
       var savedUrl = localStorage.getItem(SHEET_KEY);
       var box = document.getElementById("sheet_url");
-      if (savedUrl && box) box.value = savedUrl;
+      if (savedUrl) {
+        if (box) box.value = savedUrl;
+        // remember the target sheet; the token is per-session and still needs
+        // a tap on Connect, but at least we know where we are meant to save
+        sheetId = sheetIdFrom(savedUrl);
+      }
     } catch (e) {}
+    gsiPromise = loadScript(GSI_SRC).catch(function () {});
     var cached = readLocal();
     if (cached && cached.files && Object.keys(cached.files).length) {
       send("fs_load", JSON.stringify({
@@ -1309,6 +1329,8 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
                                body, " — saving there", class_="cs-status")
         elif src == "folder":
             dot, label = "on", f"Folder · {STORE.folder}"
+        elif c.get("sheetLinked"):
+            dot, label = "warn", "Sheet remembered — tap Connect to sign in on this device"
         elif src == "browser":
             dot, label = "warn", "Restored from this browser — not saved to a file yet"
         else:
@@ -1331,10 +1353,17 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
 
     @render.ui
     def storage_note():
+        changed()
         c = caps()
         if not c:
             return None
         bits = []
+        if c.get("sheetLinked") and STORE.source != "sheet":
+            bits.append(alert(
+                "This device knows which sheet to use but isn't signed in yet. Sign-in "
+                "is per-device and per-session, so tap Connect before saving — "
+                "otherwise changes stay in this browser only.", "warn",
+                "tabler:cloud-off"))
         if not c.get("storage"):
             bits.append(alert(
                 "This browser is blocking local storage, so changes will not survive a "
